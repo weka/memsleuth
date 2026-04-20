@@ -20,11 +20,13 @@ NUMA_ROOT = Path("/sys/devices/system/node")
 MEMINFO = Path("/proc/meminfo")
 PROC = Path("/proc")
 
+_ONLINE_NUMA_NODES_CACHE: list[list[int]] = []
+
 PROC_HP_FIELDS = ("AnonHugePages", "ShmemPmdMapped", "FilePmdMapped",
                   "Shared_Hugetlb", "Private_Hugetlb")
 
 SMAPS_HEADER_RE = re.compile(
-    r"^[0-9a-f]+-[0-9a-f]+\s+(?P<perms>\S+)\s+\S+\s+\S+\s+\S+(?:\s+(?P<path>.*))?$"
+    r"^(?P<start>[0-9a-f]+)-[0-9a-f]+\s+(?P<perms>\S+)\s+\S+\s+\S+\s+\S+(?:\s+(?P<path>.*))?$"
 )
 SMAPS_FIELDS = {
     "Size": "size",
@@ -275,7 +277,11 @@ def parse_smaps(pid: str) -> tuple[list[dict] | None, str | None]:
                 entries.append(current)
             path = (m.group("path") or "").strip()
             perms = m.group("perms")
-            current = {"perms": perms, "path": path,
+            try:
+                start = int(m.group("start"), 16)
+            except (TypeError, ValueError):
+                start = 0
+            current = {"perms": perms, "path": path, "start": start,
                        "category": categorize_vma(path, perms)}
             for attr in SMAPS_INT_ATTRS:
                 current[attr] = 0
@@ -290,6 +296,114 @@ def parse_smaps(pid: str) -> tuple[list[dict] | None, str | None]:
     if current is not None:
         entries.append(current)
     return entries, None
+
+
+def online_numa_nodes() -> list[int]:
+    """Return the list of online NUMA node IDs, cached.
+
+    Parses /sys/devices/system/node/online (kernel's cpulist syntax:
+    '0-3' or '0,2,4-7'). Falls back to the directory listing if the
+    file is missing.
+    """
+    if _ONLINE_NUMA_NODES_CACHE:
+        return _ONLINE_NUMA_NODES_CACHE[0]
+    nodes: list[int] = []
+    online_file = NUMA_ROOT / "online"
+    try:
+        text = online_file.read_text().strip()
+    except OSError:
+        text = ""
+    if text:
+        for part in text.split(","):
+            part = part.strip()
+            if "-" in part:
+                a, b = part.split("-", 1)
+                nodes.extend(range(int(a), int(b) + 1))
+            elif part:
+                nodes.append(int(part))
+    elif NUMA_ROOT.is_dir():
+        for entry in NUMA_ROOT.iterdir():
+            m = re.match(r"node(\d+)$", entry.name)
+            if m:
+                nodes.append(int(m.group(1)))
+    nodes.sort()
+    _ONLINE_NUMA_NODES_CACHE.append(nodes)
+    return nodes
+
+
+def parse_numa_maps(pid: str) -> dict[int, dict] | None:
+    """Parse /proc/<pid>/numa_maps into ``{vma_start: info}``.
+
+    ``info`` is ``{"nodes": {node_id: bytes}, "huge": bool}``. The
+    ``huge`` flag is raised by the presence of the ``huge`` token in
+    the line, which the kernel emits for hugetlbfs-backed mappings;
+    those pages are NOT counted in smaps Rss, so they must be routed
+    to the HugeTLB bucket rather than the per-category RSS totals to
+    avoid double-counting.
+
+    Each line carries its own ``kernelpagesize_kB`` — 4 for regular
+    pages, 2048 for THP, 1048576 for 1 GiB hugetlb — so every line is
+    scaled individually before summing.
+    """
+    try:
+        text = (PROC / pid / "numa_maps").read_text()
+    except (PermissionError, FileNotFoundError):
+        return None
+    except OSError:
+        return None
+    result: dict[int, dict] = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        try:
+            addr = int(parts[0], 16)
+        except ValueError:
+            continue
+        page_kb = 4
+        raw: list[tuple[int, int]] = []
+        is_huge = False
+        for tok in parts[1:]:
+            if tok == "huge":
+                is_huge = True
+            elif tok.startswith("kernelpagesize_kB="):
+                try:
+                    page_kb = int(tok.split("=", 1)[1])
+                except ValueError:
+                    pass
+            elif tok and tok[0] == "N" and "=" in tok:
+                key, _, val = tok.partition("=")
+                try:
+                    raw.append((int(key[1:]), int(val)))
+                except ValueError:
+                    pass
+        if not raw:
+            continue
+        scale = page_kb * 1024
+        per_node: dict[int, int] = {}
+        for node, count in raw:
+            per_node[node] = per_node.get(node, 0) + count * scale
+        result[addr] = {"nodes": per_node, "huge": is_huge}
+    return result
+
+
+def compact_size(nbytes: int) -> str:
+    """Short byte formatting (``2.1G``, ``512M``, ``48K``, ``0``) for
+    dense per-node columns where a full ``human()`` would be too wide."""
+    if nbytes <= 0:
+        return "0"
+    if nbytes >= 1 << 30:
+        return f"{nbytes / (1 << 30):.1f}G"
+    if nbytes >= 1 << 20:
+        return f"{nbytes / (1 << 20):.0f}M"
+    if nbytes >= 1 << 10:
+        return f"{nbytes / (1 << 10):.0f}K"
+    return str(nbytes)
+
+
+def format_numa_rss(per_node: dict[int, int], nodes: list[int]) -> str:
+    """``N0/N1/N2/...`` compact per-node RSS string."""
+    return "/".join(compact_size(per_node.get(n, 0)) for n in nodes)
 
 
 def read_process_name(pid: str) -> str:
@@ -478,8 +592,24 @@ def classify_container(pid: str) -> tuple[str, str]:
 
 SEGMENT_MIN_SHARED = 64 * 1024  # only list segments sharing ≥64 KiB
 
+# Categories carried over to NUMA sub-rows. Code/heap/stack/anon/data
+# map one VMA to one bucket directly. shmem maps to data_rss too (it
+# typically means /dev/shm or MAP_SHARED+MAP_ANON — both "data" for
+# layout purposes). file-data (non-exec file mappings) deliberately
+# does NOT contribute to AnonData.
+NUMA_CAT_MAP = {
+    "code": "code_rss",
+    "heap": "heap_rss",
+    "stack": "stack_rss",
+    "anon": "data_rss",
+    "shmem": "data_rss",
+}
+NUMA_FIELDS = ("rss", "code_rss", "heap_rss", "stack_rss",
+               "data_rss", "shared_rss", "hugetlb")
 
-def aggregate_process(entries: list[dict], keep_segments: bool = False) -> dict:
+
+def aggregate_process(entries: list[dict], keep_segments: bool = False,
+                      numa_data: dict[int, dict] | None = None) -> dict:
     """Roll VMA entries up into a per-process summary.
 
     When keep_segments is True, also return a `segments` list of the
@@ -494,6 +624,12 @@ def aggregate_process(entries: list[dict], keep_segments: bool = False) -> dict:
         "swap": 0, "exe_ondisk": 0, "file_ondisk": 0,
     }
     segments: list[dict] = [] if keep_segments else []
+    numa: dict[str, dict[int, int]] = {f: {} for f in NUMA_FIELDS} if numa_data is not None else {}
+
+    def _add(bucket: str, node: int, amount: int) -> None:
+        d = numa[bucket]
+        d[node] = d.get(node, 0) + amount
+
     for v in entries:
         agg["rss"] += v["rss"]
         agg["pss"] += v["pss"]
@@ -526,6 +662,30 @@ def aggregate_process(entries: list[dict], keep_segments: bool = False) -> dict:
             agg["file_ondisk"] += max(0, v["size"] - v["rss"])
         agg["hugetlb_priv"] += v["hugetlb_priv"]
         agg["hugetlb_shared"] += v["hugetlb_shared"]
+
+        if numa_data is not None:
+            info = numa_data.get(v["start"])
+            if info:
+                nodes = info["nodes"]
+                if info["huge"]:
+                    # Hugetlbfs pages: excluded from smaps Rss, accounted
+                    # only on the HugeTLB track so sums line up.
+                    for n, b in nodes.items():
+                        _add("hugetlb", n, b)
+                else:
+                    for n, b in nodes.items():
+                        _add("rss", n, b)
+                    cat_key = NUMA_CAT_MAP.get(cat)
+                    if cat_key:
+                        for n, b in nodes.items():
+                            _add(cat_key, n, b)
+                    # Shared is a property of pages (not the VMA), so
+                    # attribute proportionally by Shared / Rss.
+                    if v["rss"] > 0 and shared > 0:
+                        frac = shared / v["rss"]
+                        for n, b in nodes.items():
+                            _add("shared_rss", n, int(b * frac))
+
         if keep_segments and shared >= SEGMENT_MIN_SHARED:
             segments.append({
                 "path": v["path"] or "(anon)",
@@ -551,11 +711,19 @@ def aggregate_process(entries: list[dict], keep_segments: bool = False) -> dict:
                 merged[key] = dict(s)
         agg["segments"] = sorted(merged.values(),
                                   key=lambda s: s["shared"], reverse=True)
+    if numa_data is not None:
+        for f in NUMA_FIELDS:
+            agg[f"numa_{f}"] = numa[f]
     return agg
 
 
-def collect_process_details(keep_segments: bool = False) -> tuple[list[dict], int, int]:
-    """Walk /proc scanning smaps. Returns (rows, denied, kernel_threads)."""
+def collect_process_details(keep_segments: bool = False,
+                              include_numa: bool = False) -> tuple[list[dict], int, int]:
+    """Walk /proc scanning smaps. Returns (rows, denied, kernel_threads).
+
+    When ``include_numa`` is True, each row also carries a
+    ``numa_rss`` dict {node_id: bytes} parsed from /proc/<pid>/numa_maps.
+    """
     rows: list[dict] = []
     denied = 0
     gone = 0
@@ -569,7 +737,9 @@ def collect_process_details(keep_segments: bool = False) -> tuple[list[dict], in
         if err == "gone" or entries is None:
             gone += 1
             continue
-        agg = aggregate_process(entries, keep_segments=keep_segments)
+        numa_data = parse_numa_maps(entry.name) if include_numa else None
+        agg = aggregate_process(entries, keep_segments=keep_segments,
+                                  numa_data=numa_data)
         if agg["rss"] == 0 and agg["hugetlb_priv"] == 0 and agg["hugetlb_shared"] == 0:
             continue
         agg["pid"] = int(entry.name)
@@ -598,7 +768,8 @@ PROC_TABLE_WIDTHS = (8, 44, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12)
 
 
 def _print_process_table(rows: list[dict], top: int | None,
-                          show_segments: bool, indent: str) -> None:
+                          show_segments: bool, indent: str,
+                          numa_nodes: list[int] | None = None) -> None:
     print(indent + "  ".join(f"{c:<{w}}" if i < 2 else f"{c:>{w}}"
                               for i, (c, w) in enumerate(
                                   zip(PROC_TABLE_HDR, PROC_TABLE_WIDTHS))))
@@ -618,10 +789,48 @@ def _print_process_table(rows: list[dict], top: int | None,
         print(indent + "  ".join(f"{v:<{w}}" if i < 2 else f"{v:>{w}}"
                                   for i, (v, w) in enumerate(
                                       zip(vals, PROC_TABLE_WIDTHS))))
+        if numa_nodes:
+            _print_numa_subrows(r, numa_nodes, indent)
         if show_segments:
             _print_segments(r.get("segments", []))
     if top and len(rows) > top:
         print(f"{indent}... {len(rows) - top} more (use --top 0 for all)")
+
+
+def _print_numa_subrows(row: dict, nodes: list[int], indent: str) -> None:
+    """Emit one ``N<id>`` sub-row per NUMA node with per-category bytes.
+
+    The node label sits in the Command column so each sub-row reads as
+    an annotation of the process above it. Swap / ExeSwap / FileSwap
+    show as ``—`` (disk-backed, not NUMA-resident); THP columns show
+    as ``—`` too — they're a subset of RSS and already broken out by
+    node via the RSS/Code/AnonData cells.
+    """
+    na = "—"
+    rss = row.get("numa_rss", {})
+    code = row.get("numa_code_rss", {})
+    heap = row.get("numa_heap_rss", {})
+    stack = row.get("numa_stack_rss", {})
+    anon = row.get("numa_data_rss", {})
+    shared = row.get("numa_shared_rss", {})
+    hugetlb = row.get("numa_hugetlb", {})
+    for n in nodes:
+        vals = (
+            "",
+            f"N{n}",
+            compact_size(rss.get(n, 0)),
+            compact_size(code.get(n, 0)),
+            compact_size(heap.get(n, 0)),
+            compact_size(stack.get(n, 0)),
+            compact_size(anon.get(n, 0)),
+            compact_size(shared.get(n, 0)),
+            na, na, na,          # Swap / ExeSwap / FileSwap
+            na, na,              # THP/code / THP/data
+            compact_size(hugetlb.get(n, 0)),
+        )
+        print(indent + "  ".join(f"{v:<{w}}" if i < 2 else f"{v:>{w}}"
+                                  for i, (v, w) in enumerate(
+                                      zip(vals, PROC_TABLE_WIDTHS))))
 
 
 def aggregate_containers(rows: list[dict]) -> list[dict]:
@@ -679,8 +888,15 @@ def _print_container_summary(containers: list[dict]) -> None:
 
 
 def print_process_details(top: int | None, show_segments: bool,
-                           group_by_container: bool) -> None:
-    rows, denied, gone = collect_process_details(keep_segments=show_segments)
+                           group_by_container: bool,
+                           show_numa: bool = False) -> None:
+    numa_nodes = online_numa_nodes() if show_numa else []
+    # Only worth adding the column when the host is actually multi-node.
+    numa_nodes = numa_nodes if len(numa_nodes) > 1 else []
+    rows, denied, gone = collect_process_details(
+        keep_segments=show_segments,
+        include_numa=bool(numa_nodes),
+    )
     if rows:
         rows.sort(key=lambda r: r["rss"], reverse=True)
 
@@ -705,13 +921,15 @@ def print_process_details(top: int | None, show_segments: bool,
             if hugetlb:
                 header_bits.append(f"hugetlb={human(hugetlb)}")
             print(f"\n  [{c['label']}]  " + "  ".join(header_bits))
-            _print_process_table(proc_rows, top, show_segments, indent="    ")
+            _print_process_table(proc_rows, top, show_segments, indent="    ",
+                                  numa_nodes=numa_nodes or None)
     else:
         print("Per-process memory detail")
         if not rows:
             print("  (no processes with user memory found)")
         else:
-            _print_process_table(rows, top, show_segments, indent="  ")
+            _print_process_table(rows, top, show_segments, indent="  ",
+                                  numa_nodes=numa_nodes or None)
 
     if has_containers:
         _print_container_summary(containers)
@@ -906,6 +1124,31 @@ NUMA hugepage breakdown (--numa)
   Same columns as the HugeTLB table but pulled from /sys/devices/system/node/nodeN. The kernel does
   not expose Rsvd or Overcmt per node.
 
+Per-process NUMA sub-rows (--numa with --procs)
+-----------------------------------------------
+On multi-node hosts, each process row is followed by one ``N<id>`` sub-row per online NUMA node.
+Each sub-row breaks down where that process's pages live by category, using compact sizes
+('2.1G', '512M', '48K', '0').
+
+Sub-row columns:
+  RSS        Non-hugetlb resident bytes on this node (regular 4 KiB + 2 MiB THP).
+  Code       File-backed executable bytes on this node.
+  Heap       [heap] bytes on this node.
+  Stack      [stack] / [stack:tid] bytes on this node.
+  AnonData   Anonymous mapping bytes on this node (shmem merged in).
+  Shared     Shared_Clean + Shared_Dirty share of the node's bytes, attributed proportionally by
+             (Shared / Rss) per VMA — not a direct kernel count, so the per-node sum may be a few
+             bytes off the total Shared column due to rounding.
+  HugeTLB    Hugetlbfs pages on this node (kernel-reported; these are NOT counted in RSS so the
+             HugeTLB column and the RSS sub-row numbers don't overlap).
+  Swap / ExeSwap / FileSwap / THP/code / THP/data  render as '—' in sub-rows — swap is disk-backed
+  (no NUMA attribution), and THP columns are already accounted inside the RSS/Code/AnonData cells.
+
+Data source is /proc/<pid>/numa_maps. Each VMA line reports ``N<id>=<pages>`` and
+``kernelpagesize_kB`` — the parser matches each line to its smaps VMA by start address and scales
+by the line's own page size (4 KiB, 2 MiB for THP, 1 GiB for hugetlb). The ``huge`` token in a
+numa_maps line routes those bytes to HugeTLB instead of RSS, so the two sets don't double-count.
+
 Kernel Direct Map
 -----------------
   DirectMap4k/2M/1G — how the kernel's linear mapping of physical RAM is split across 4 KiB / 2 MiB
@@ -936,7 +1179,8 @@ def main(argv: list[str] | None = None) -> int:
         formatter_class=formatter,
     )
     ap.add_argument("--numa", action="store_true",
-                    help="break down hugepages per NUMA node")
+                    help="break down hugepages per NUMA node; with --procs also adds a per-process "
+                         "'RSS by NUMA' column showing per-node residency (N0/N1/... compact)")
     ap.add_argument("--procs", action="store_true",
                     help="show per-process memory breakdown (RSS, code, heap, stack, THP, hugetlb)")
     ap.add_argument("--shared", action="store_true",
@@ -973,7 +1217,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.procs or args.shared or args.containers:
         print_process_details(args.top or None,
                                show_segments=args.shared,
-                               group_by_container=args.containers)
+                               group_by_container=args.containers,
+                               show_numa=args.numa)
     if not args.no_directmap:
         print_directmap(mem)
     return 0

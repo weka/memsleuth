@@ -49,6 +49,17 @@ All logic lives in `memsleuth.py`. The flow is **collect → aggregate → print
 
 `~sharers` in the shared-segment output is approximated as `round(Rss / Pss)` per VMA. The kernel doesn't directly expose how many processes map a region; `Pss` gives us that for free.
 
+### Per-process NUMA attribution
+
+`--numa` with `--procs` emits one `N<id>` sub-row per online NUMA node under each process, covering RSS / Code / Heap / Stack / AnonData / Shared / HugeTLB. Two data sources are cross-referenced:
+
+- `/proc/<pid>/smaps` gives the VMA category (`code`, `heap`, etc.) and start address.
+- `/proc/<pid>/numa_maps` gives per-VMA `N<id>=<pages>`, `kernelpagesize_kB`, and a `huge` token for hugetlbfs mappings.
+
+`parse_numa_maps` returns `{vma_start: {"nodes": {n: bytes}, "huge": bool}}`. `aggregate_process` matches by `start` — this is why `SMAPS_HEADER_RE` captures `(?P<start>[0-9a-f]+)`. The `huge` flag is critical: hugetlbfs pages are NOT in smaps Rss (they live under `Private_Hugetlb` / `Shared_Hugetlb`), so those bytes route to the `hugetlb` bucket and never touch RSS. Without that split the per-NUMA sum would double-count hugetlb workloads like Weka.
+
+`Shared` per-node is attributed proportionally (`Shared / Rss` per VMA); the kernel doesn't expose a direct per-page shared count. Every other category's VMAs map one-to-one to a bucket. `online_numa_nodes()` reads `/sys/devices/system/node/online` (kernel cpulist syntax, cached). Sub-rows are suppressed on single-node hosts. `compact_size()` (`2.1G`, `512M`, `48K`, `0`) replaces `human()` in sub-rows so all cells stay within the main table's column widths. Swap/ExeSwap/FileSwap/THP cells render as `—` because they're disk-backed or already accounted inside the per-node RSS.
+
 ### Container classification
 
 `classify_container(pid)` reads `/proc/<pid>/cgroup` via `read_cgroup_info`, which returns **every** hierarchy's path plus a "primary" (v2 unified, else v1 memory/pids). Container detection scans all paths — this matters for runtimes that pin the container id on a **named v1 hierarchy** (e.g. Weka writes `name=weka:/container/weka/default3` while the memory/pids/unified controllers all point at `/system.slice/weka-agent.service`). Looking only at the unified line silently misidentifies every such process as `system.slice`. The structural `system.slice` / `user.slice` / `system` buckets (steps 3–5 below) use only the primary path. Priority:

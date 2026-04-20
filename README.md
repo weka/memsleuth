@@ -412,7 +412,9 @@ Kernel Direct Map (physical memory mapped by page size)
   DirectMap1G:      388.00 GiB
 ```
 
-### 5. NUMA hugepage split (`--numa`)
+### 5. NUMA breakdown (`--numa`)
+
+Splits each hugepage pool by NUMA node. **Combined with `--procs`**, each process row is followed by one `N<id>` sub-row per online NUMA node, breaking down `RSS`, `Code`, `Heap`, `Stack`, `AnonData`, `Shared`, and `HugeTLB` per node (Swap/ExeSwap/FileSwap/THP columns show `—` in sub-rows — they're disk-backed or already accounted in the RSS cells). Numbers come from `/proc/<pid>/numa_maps`, matched to smaps VMAs by start address and scaled by each line's own `kernelpagesize_kB`, so 4 KiB pages, 2 MiB THP, and 1 GiB hugetlb are all handled. The `huge` token on a numa_maps line routes those bytes to HugeTLB instead of RSS so the two don't double-count. Sub-rows are suppressed on single-node hosts.
 
 ```text
 Memory
@@ -443,6 +445,156 @@ HugeTLB Pages per NUMA node
           Size   Total    Free Surplus    Used    Mem Used    Mem Free
       2.00 MiB    3695       0       0    3695    7.22 GiB         0 B
       1.00 GiB       0       0       0       0         0 B         0 B
+
+Kernel Direct Map (physical memory mapped by page size)
+  DirectMap4k:        9.26 GiB
+  DirectMap2M:      116.38 GiB
+  DirectMap1G:      388.00 GiB
+```
+
+### 6. NUMA detailed (`--numa --proc`)
+
+Provides detailed info for the process components on what NUMAs they reside
+
+```text
+Memory
+               total        used        free      shared    buff/cache     available
+Mem:      503.45 GiB  141.15 GiB  314.89 GiB    2.53 GiB     47.41 GiB    359.03 GiB
+Swap:       8.00 GiB         0 B    8.00 GiB
+
+HugeTLB Pages (explicit hugepage pools)
+         Size    Total     Free     Rsvd  Surplus  Overcmt     Used     Mem Used     Mem Free
+     2.00 MiB     7260        0        0        0        0     7260    14.18 GiB          0 B
+     1.00 GiB       65        0        0        0        0       65    65.00 GiB          0 B
+  Pool total: 79.18 GiB  used: 79.18 GiB  free: 0 B
+
+HugeTLB Pages per NUMA node
+  node0
+          Size   Total    Free Surplus    Used    Mem Used    Mem Free
+      2.00 MiB    3525       0       0    3525    6.88 GiB         0 B
+      1.00 GiB       0       0       0       0         0 B         0 B
+  node1
+          Size   Total    Free Surplus    Used    Mem Used    Mem Free
+      2.00 MiB      15       0       0      15   30.00 MiB         0 B
+      1.00 GiB      39       0       0      39   39.00 GiB         0 B
+  node2
+          Size   Total    Free Surplus    Used    Mem Used    Mem Free
+      2.00 MiB      25       0       0      25   50.00 MiB         0 B
+      1.00 GiB      26       0       0      26   26.00 GiB         0 B
+  node3
+          Size   Total    Free Surplus    Used    Mem Used    Mem Free
+      2.00 MiB    3695       0       0    3695    7.22 GiB         0 B
+      1.00 GiB       0       0       0       0         0 B         0 B
+
+Per-process memory detail
+  PID       Command                                                RSS          Code          Heap         Stack      AnonData        Shared          Swap       ExeSwap      FileSwap      THP/code      THP/data       HugeTLB
+  845836    wekanode --slot 0 --container-name default4       3.55 GiB    104.50 MiB      7.08 MiB    132.00 KiB      2.22 GiB    305.69 MiB           0 B           0 B           0 B           0 B           0 B           0 B
+            N0                                                    1.2G          102M             0             0          341M          299M             —             —             —             —             —             0
+            N1                                                    1.7G          204K            7M          132K          1.2G            1M             —             —             —             —             —             0
+            N2                                                    500K          304K             0             0          132K          368K             —             —             —             —             —             0
+            N3                                                    687M            2M          132K             0          682M            5M             —             —             —             —             —             0
+  845837    wekanode --slot 0 --container-name default3       3.53 GiB    104.50 MiB      6.65 MiB    132.00 KiB      2.21 GiB    295.79 MiB           0 B           0 B           0 B           0 B           0 B           0 B
+            N0                                                    988M          102M          376K             0          104M          291M             —             —             —             —             —             0
+            N1                                                    1.1G          204K            4M             0          1.0G          308K             —             —             —             —             —             0
+            N2                                                    141M          304K          144K             0          141M          374K             —             —             —             —             —             0
+            N3                                                    1.3G            2M            2M          132K          983M            4M             —             —             —             —             —             0
+  845825    wekanode --slot 0 --container-name default1       3.46 GiB    104.50 MiB      4.58 MiB    132.00 KiB      2.14 GiB    285.81 MiB           0 B           0 B           0 B           0 B           0 B           0 B
+            N0                                                    2.3G          102M            2M          132K          1.3G          264M             —             —             —             —             —             0
+            N1                                                    923M          204K            2M             0          856M           16M             —             —             —             —             —             0
+            N2                                                      1M          304K          640K             0          388K          369K             —             —             —             —             —             0
+            N3                                                    297M            2M          200K             0            2M            5M             —             —             —             —             —             0
+  845830    wekanode --slot 0 --container-name default2       3.46 GiB    104.50 MiB      4.10 MiB    132.00 KiB      2.14 GiB    295.79 MiB           0 B           0 B           0 B           0 B           0 B           0 B
+            N0                                                    800M          102M          288K             0          208M          289M             —             —             —             —             —             0
+            N1                                                    834M          204K            2M            4K          735M            2M             —             —             —             —             —             0
+            N2                                                    504K          304K             0             0          132K          368K             —             —             —             —             —             0
+            N3                                                    1.9G            2M            2M          128K          1.2G            4M             —             —             —             —             —             0
+  845845    wekanode --slot 0 --container-name default0       3.46 GiB    104.50 MiB      4.57 MiB    132.00 KiB      2.14 GiB    294.79 MiB           0 B           0 B           0 B           0 B           0 B           0 B
+            N0                                                    1.1G          102M          148K             0          245M          288M             —             —             —             —             —             0
+            N1                                                   1003M          204K            1M             0          906M          341K             —             —             —             —             —             0
+            N2                                                    1.4G          304K            2M          132K          1.0G            2M             —             —             —             —             —             0
+            N3                                                      7M            2M            2M             0             0            5M             —             —             —             —             —             0
+  847602    wekanode --slot 2 --container-name default3       3.40 GiB    117.28 MiB     50.80 MiB    132.00 KiB      2.90 GiB    319.50 MiB           0 B           0 B     13.01 GiB           0 B           0 B     13.01 GiB
+            N0                                                    264M          102M             0             0             0          264M             —             —             —             —             —             0
+            N1                                                    404K          312K             0             0             0          404K             —             —             —             —             —             0
+            N2                                                    3.1G           12M           51M          132K          2.9G           51M             —             —             —             —             —         13.0G
+            N3                                                      4M            3M             0             0             0            4M             —             —             —             —             —             0
+  847090    wekanode --slot 2 --container-name default4       3.40 GiB    117.28 MiB     42.18 MiB    132.00 KiB      2.90 GiB    319.50 MiB           0 B           0 B     13.01 GiB           0 B           0 B     13.01 GiB
+            N0                                                    263M          102M             0             0             0          263M             —             —             —             —             —             0
+            N1                                                    404K          312K             0             0             0          404K             —             —             —             —             —             0
+            N2                                                    3.1G           12M           42M          132K          2.9G           51M             —             —             —             —             —         13.0G
+            N3                                                      4M            3M             0             0             0            4M             —             —             —             —             —             0
+  848861    wekanode --slot 2 --container-name default2       3.40 GiB    117.28 MiB     42.19 MiB    132.00 KiB      2.90 GiB    319.50 MiB           0 B           0 B     13.01 GiB           0 B           0 B     13.01 GiB
+            N0                                                    263M          102M             0             0             0          263M             —             —             —             —             —             0
+            N1                                                    3.1G          312K           42M          132K          2.9G           35M             —             —             —             —             —         13.0G
+            N2                                                     18M           12M             0             0             0           18M             —             —             —             —             —            2M
+            N3                                                      4M            3M             0             0             0            4M             —             —             —             —             —             0
+  848842    wekanode --slot 2 --container-name default0       3.40 GiB    117.28 MiB     40.86 MiB    132.00 KiB      2.90 GiB    319.50 MiB           0 B           0 B     13.01 GiB           0 B           0 B     13.01 GiB
+            N0                                                    263M          102M             0             0             0          263M             —             —             —             —             —             0
+            N1                                                    3.1G          312K           41M          132K          2.9G           34M             —             —             —             —             —         13.0G
+            N2                                                     18M           12M             0             0             0           18M             —             —             —             —             —            2M
+            N3                                                      4M            3M             0             0             0            4M             —             —             —             —             —             0
+  848838    wekanode --slot 2 --container-name default1       3.37 GiB    117.28 MiB     44.64 MiB    132.00 KiB      2.88 GiB    319.50 MiB           0 B           0 B     13.01 GiB           0 B           0 B     13.01 GiB
+            N0                                                    263M          102M             0             0             0          263M             —             —             —             —             —             0
+            N1                                                    3.1G          312K           45M          132K          2.9G           34M             —             —             —             —             —         13.0G
+            N2                                                     18M           12M             0             0             0           18M             —             —             —             —             —            2M
+            N3                                                      4M            3M             0             0             0            4M             —             —             —             —             —             0
+  847066    wekanode --slot 1 --container-name default4       2.18 GiB    117.28 MiB     21.00 MiB    132.00 KiB      1.54 GiB    299.57 MiB           0 B           0 B      1.43 GiB           0 B           0 B      1.38 GiB
+            N0                                                    2.2G          102M           21M          132K          1.5G          277M             —             —             —             —             —          1.4G
+            N1                                                    404K          312K             0             0             0          404K             —             —             —             —             —             0
+            N2                                                     18M           12M             0             0             0           18M             —             —             —             —             —            2M
+            N3                                                      4M            3M             0             0             0            4M             —             —             —             —             —             0
+  847598    wekanode --slot 1 --container-name default3       2.18 GiB    117.28 MiB     21.00 MiB    132.00 KiB      1.54 GiB    297.58 MiB           0 B           0 B      1.43 GiB           0 B           0 B      1.38 GiB
+            N0                                                    2.2G          102M           21M          132K          1.5G          276M             —             —             —             —             —          1.4G
+            N1                                                    404K          312K             0             0             0          404K             —             —             —             —             —             0
+            N2                                                     18M           12M             0             0             0           18M             —             —             —             —             —            2M
+            N3                                                      4M            3M             0             0             0            4M             —             —             —             —             —             0
+  848839    wekanode --slot 1 --container-name default0       2.18 GiB    117.28 MiB     21.00 MiB    132.00 KiB      1.54 GiB    296.58 MiB           0 B           0 B      1.43 GiB           0 B           0 B      1.38 GiB
+            N0                                                    2.2G          102M           21M          132K          1.5G          274M             —             —             —             —             —          1.4G
+            N1                                                    408K          312K             0             0             0          408K             —             —             —             —             —             0
+            N2                                                     18M           12M             0             0             0           18M             —             —             —             —             —            2M
+            N3                                                      4M            3M             0             0             0            4M             —             —             —             —             —             0
+  848845    wekanode --slot 1 --container-name default1       2.18 GiB    117.28 MiB     21.00 MiB    132.00 KiB      1.54 GiB    292.60 MiB           0 B           0 B      1.43 GiB           0 B           0 B      1.38 GiB
+            N0                                                    2.2G          102M           21M          132K          1.5G          270M             —             —             —             —             —          1.4G
+            N1                                                    472K          312K             0             0             0          472K             —             —             —             —             —             0
+            N2                                                     18M           12M             0             0             0           18M             —             —             —             —             —            2M
+            N3                                                      4M            3M             0             0             0            4M             —             —             —             —             —             0
+  848846    wekanode --slot 1 --container-name default2       2.18 GiB    117.28 MiB     21.00 MiB    132.00 KiB      1.54 GiB    296.58 MiB           0 B           0 B      1.43 GiB           0 B           0 B      1.38 GiB
+            N0                                                    2.2G          102M           21M          132K          1.5G          274M             —             —             —             —             —          1.4G
+            N1                                                   1020K          312K             0             0             0         1020K             —             —             —             —             —             0
+            N2                                                     18M           12M             0             0             0           18M             —             —             —             —             —            2M
+            N3                                                      4M            3M             0             0             0            4M             —             —             —             —             —             0
+  ... 135 more (use --top 0 for all)
+
+Per-container summary (grouped by PID namespace / cgroup)
+  Container                      Procs           RSS          Code          Heap         Stack      AnonData        Shared          Swap       ExeSwap      FileSwap      THP/code      THP/data       HugeTLB
+  weka:default4                     22     11.81 GiB    568.13 MiB    144.59 MiB      2.23 MiB      8.54 GiB      1.47 GiB           0 B     56.57 MiB     16.36 GiB           0 B           0 B     15.84 GiB
+  weka:default3                     22     11.78 GiB    568.38 MiB    153.20 MiB      2.22 MiB      8.53 GiB      1.43 GiB           0 B     56.32 MiB     16.38 GiB           0 B           0 B     15.84 GiB
+  weka:default0                     22     11.69 GiB    567.77 MiB    141.34 MiB      2.21 MiB      8.45 GiB      1.43 GiB           0 B     56.93 MiB     16.38 GiB           0 B           0 B     15.84 GiB
+  weka:default2                     21     11.67 GiB    566.70 MiB    141.54 MiB      2.20 MiB      8.44 GiB      1.43 GiB           0 B     56.29 MiB     16.38 GiB           0 B           0 B     15.84 GiB
+  weka:default1                     22     11.63 GiB    567.44 MiB    144.39 MiB      2.23 MiB      8.41 GiB      1.39 GiB           0 B     57.26 MiB     16.40 GiB           0 B           0 B     15.84 GiB
+  system.slice                      24    592.02 MiB    135.05 MiB     28.09 MiB    888.00 KiB    159.81 MiB    261.23 MiB           0 B    108.44 MiB    181.89 MiB           0 B           0 B           0 B
+  user.slice                        16    167.89 MiB     62.84 MiB     39.05 MiB      2.33 MiB     26.00 MiB     91.51 MiB           0 B     32.62 MiB     46.46 MiB           0 B           0 B           0 B
+  system                             1     14.00 MiB      6.05 MiB      3.29 MiB     52.00 KiB    176.00 KiB      9.36 MiB           0 B      5.90 MiB      2.18 MiB           0 B           0 B           0 B
+
+HugeTLB (hugetlbfs) users — Private / Shared
+  PID       Command                                              Private          Shared           Total
+  847602    wekanode --slot 2 --container-name default3        13.01 GiB             0 B       13.01 GiB
+  847090    wekanode --slot 2 --container-name default4        13.01 GiB             0 B       13.01 GiB
+  848861    wekanode --slot 2 --container-name default2        13.01 GiB             0 B       13.01 GiB
+  848842    wekanode --slot 2 --container-name default0        13.01 GiB             0 B       13.01 GiB
+  848838    wekanode --slot 2 --container-name default1        13.01 GiB             0 B       13.01 GiB
+  847023    wekanode --slot 3 --container-name default4         1.45 GiB             0 B        1.45 GiB
+  847593    wekanode --slot 3 --container-name default3         1.45 GiB             0 B        1.45 GiB
+  848840    wekanode --slot 3 --container-name default1         1.45 GiB             0 B        1.45 GiB
+  848852    wekanode --slot 3 --container-name default2         1.45 GiB             0 B        1.45 GiB
+  848879    wekanode --slot 3 --container-name default0         1.45 GiB             0 B        1.45 GiB
+  847066    wekanode --slot 1 --container-name default4         1.38 GiB             0 B        1.38 GiB
+  847598    wekanode --slot 1 --container-name default3         1.38 GiB             0 B        1.38 GiB
+  848839    wekanode --slot 1 --container-name default0         1.38 GiB             0 B        1.38 GiB
+  848845    wekanode --slot 1 --container-name default1         1.38 GiB             0 B        1.38 GiB
+  848846    wekanode --slot 1 --container-name default2         1.38 GiB             0 B        1.38 GiB
+
+  note: 1 kernel threads / exited processes skipped
 
 Kernel Direct Map (physical memory mapped by page size)
   DirectMap4k:        9.26 GiB

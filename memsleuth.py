@@ -10,6 +10,7 @@ down per NUMA node.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from pathlib import Path
@@ -317,6 +318,164 @@ def truncate(s: str, width: int) -> str:
     return s[:width - 1] + "…"
 
 
+# Container detection. The kernel exposes no "this process is in a
+# container" bit, so we reconstruct the grouping from two signals:
+#   1. /proc/<pid>/ns/pid — PID namespace. Every container gets its own,
+#      so processes sharing an inode are in the same container.
+#   2. /proc/<pid>/cgroup — the cgroup path usually encodes the runtime
+#      (docker, podman, kubepods, lxc, nspawn, ...) and a container id.
+# We never read cgroup memory accounting; per-container numbers come
+# from summing our own per-process smaps data.
+
+# Ordered: most specific patterns first so kubepods wins over the inner
+# runc scope it wraps.
+CGROUP_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"/kubepods[.\-/].*?(?:pod)?([0-9a-f]{8}[-_][0-9a-f]{4,}[^/]*)"), "k8s"),
+    (re.compile(r"/kubepods[.\-/]"), "k8s"),
+    (re.compile(r"docker[-/]([0-9a-f]{12,64})"), "docker"),
+    (re.compile(r"libpod[-/]([0-9a-f]{12,64})"), "podman"),
+    (re.compile(r"crio[-/]([0-9a-f]{12,64})"), "crio"),
+    (re.compile(r"containerd[-/]([0-9a-f]{12,64})"), "containerd"),
+    (re.compile(r"/lxc(?:\.payload)?[./]([^/]+)"), "lxc"),
+    (re.compile(r"machine-([^./]+)\.scope"), "nspawn"),
+]
+
+_HOST_NS_CACHE: list[int | None] = []
+
+
+def pid_namespace_inode(pid: str) -> int | None:
+    """Return the nsfs inode of /proc/<pid>/ns/pid, or None if unreadable.
+
+    The symlink target format is ``pid:[4026531836]``; the bracketed
+    number is the namespace id (the nsfs inode).
+    """
+    try:
+        target = os.readlink(f"/proc/{pid}/ns/pid")
+    except OSError:
+        return None
+    try:
+        return int(target.rsplit("[", 1)[1].rstrip("]"))
+    except (ValueError, IndexError):
+        return None
+
+
+def host_pid_namespace() -> int | None:
+    """The PID namespace inode of the memsleuth process itself.
+
+    Cached because it's invariant for the run. We use /proc/self because
+    /proc/1 is often unreadable for non-root users, but /proc/self is
+    always readable by us.
+    """
+    if not _HOST_NS_CACHE:
+        _HOST_NS_CACHE.append(pid_namespace_inode("self"))
+    return _HOST_NS_CACHE[0]
+
+
+def read_cgroup_info(pid: str) -> tuple[list[str], str | None]:
+    """Parse /proc/<pid>/cgroup once. Return (all_paths, primary_path).
+
+    all_paths is every hierarchy's path (v2 unified, v1 controllers,
+    and named v1 like ``name=systemd`` or ``name=weka``). Container
+    runtimes sometimes park their identity on a named v1 hierarchy
+    while the memory/pids/unified controllers point at whatever
+    wrapper service hosts them (e.g. a Weka box pins its container
+    id on ``name=weka:/container/weka/default3`` while memory, pids,
+    and the v2 unified entry all read ``/system.slice/weka-agent.service``).
+    We have to search every line or we miss the container.
+
+    primary_path is the v2 unified path if present, else the v1
+    memory/pids controller — used only for the structural
+    system.slice / user.slice / system buckets after container
+    detection has had a chance.
+    """
+    try:
+        text = (PROC / pid / "cgroup").read_text()
+    except OSError:
+        return [], None
+    all_paths: list[str] = []
+    unified: str | None = None
+    v1_fallback: str | None = None
+    for line in text.splitlines():
+        parts = line.strip().split(":", 2)
+        if len(parts) != 3:
+            continue
+        hier, ctrl, path = parts
+        all_paths.append(path)
+        if hier == "0" and ctrl == "":
+            unified = path
+        elif ctrl in ("memory", "pids") and v1_fallback is None:
+            v1_fallback = path
+    return all_paths, unified or v1_fallback
+
+
+def container_label_from_cgroup(path: str | None) -> str | None:
+    if not path:
+        return None
+    for pattern, kind in CGROUP_PATTERNS:
+        m = pattern.search(path)
+        if m:
+            ident = (m.group(1) if m.groups() else "")[:12]
+            return f"{kind}:{ident}" if ident else kind
+    return None
+
+
+# Paths under /container/<runtime>/<id>/... belong to a custom container
+# framework (Weka's layout on the boxes we target). First two segments
+# after /container identify the container; deeper paths (sub-cgroups
+# inside the container) still map to the same bucket.
+CONTAINER_SLOT_RE = re.compile(r"^/container/([^/]+)(?:/([^/]+))?")
+
+
+def classify_container(pid: str) -> tuple[str, str]:
+    """Return (group_key, label).
+
+    Buckets in priority order:
+      1. /container/<runtime>/<id> — the Weka-style custom container layout.
+         Labelled '<runtime>:<id>'. Sub-cgroups inside the container collapse
+         into the same bucket.
+      2. Known runtime cgroup patterns (docker, podman, kubepods, crio,
+         containerd, lxc, nspawn) — labelled '<runtime>:<id>'.
+      3. /system.slice/* — one bucket, labelled 'system.slice'.
+      4. /user.slice/*   — one bucket, labelled 'user.slice' (all user UIDs).
+      5. Everything else (/, /init.scope, /system, ...) — 'system'.
+
+    A separate PID namespace alone is not treated as a container: browser
+    sandboxes (Firefox, Chromium) each get their own pid ns and would
+    flood the view.
+
+    The container search walks every cgroup hierarchy (including named
+    v1 like ``name=weka``) because runtimes such as Weka's container
+    framework record the container id on a named hierarchy while the
+    memory / pids / v2-unified lines point at the host wrapper
+    service. Matching only the unified line misses those.
+    """
+    all_paths, primary = read_cgroup_info(pid)
+    if not all_paths:
+        return ("system", "system")
+
+    # 1. Container-style layouts in ANY hierarchy (named v1 included).
+    for p in all_paths:
+        m = CONTAINER_SLOT_RE.match(p)
+        if m:
+            runtime, ident = m.group(1), m.group(2)
+            label = f"{runtime}:{ident}" if ident else f"container:{runtime}"
+            return (label, label)
+
+    # 2. Runtime patterns in any hierarchy.
+    for p in all_paths:
+        cg_label = container_label_from_cgroup(p)
+        if cg_label:
+            return (cg_label, cg_label)
+
+    # 3-5. Structural buckets from the primary path only.
+    if primary == "/system.slice" or (primary and primary.startswith("/system.slice/")):
+        return ("system.slice", "system.slice")
+    if primary == "/user.slice" or (primary and primary.startswith("/user.slice/")):
+        return ("user.slice", "user.slice")
+
+    return ("system", "system")
+
+
 SEGMENT_MIN_SHARED = 64 * 1024  # only list segments sharing ≥64 KiB
 
 
@@ -415,6 +574,9 @@ def collect_process_details(keep_segments: bool = False) -> tuple[list[dict], in
             continue
         agg["pid"] = int(entry.name)
         agg["name"] = read_process_name(entry.name)
+        key, label = classify_container(entry.name)
+        agg["container_key"] = key
+        agg["container_label"] = label
         rows.append(agg)
     return rows, denied, gone
 
@@ -429,47 +591,130 @@ def _shorten_path(path: str, width: int) -> str:
     return "..." + path[-(width - 3):]
 
 
-def print_process_details(top: int | None, show_segments: bool) -> None:
+PROC_TABLE_HDR = ("PID", "Command", "RSS", "Code", "Heap", "Stack",
+                  "AnonData", "Shared", "Swap", "ExeSwap", "FileSwap",
+                  "THP/code", "THP/data", "HugeTLB")
+PROC_TABLE_WIDTHS = (8, 44, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12)
+
+
+def _print_process_table(rows: list[dict], top: int | None,
+                          show_segments: bool, indent: str) -> None:
+    print(indent + "  ".join(f"{c:<{w}}" if i < 2 else f"{c:>{w}}"
+                              for i, (c, w) in enumerate(
+                                  zip(PROC_TABLE_HDR, PROC_TABLE_WIDTHS))))
+    shown = rows[:top] if top else rows
+    for r in shown:
+        hugetlb = r["hugetlb_priv"] + r["hugetlb_shared"]
+        vals = (
+            str(r["pid"]), truncate(r["name"], 44),
+            human(r["rss"]), human(r["code_rss"]),
+            human(r["heap_rss"]), human(r["stack_rss"]),
+            human(r["data_rss"]), human(r["shared_rss"]),
+            human(r["swap"]), human(r["exe_ondisk"]),
+            human(r["file_ondisk"]),
+            human(r["thp_code"]), human(r["thp_data"]),
+            human(hugetlb),
+        )
+        print(indent + "  ".join(f"{v:<{w}}" if i < 2 else f"{v:>{w}}"
+                                  for i, (v, w) in enumerate(
+                                      zip(vals, PROC_TABLE_WIDTHS))))
+        if show_segments:
+            _print_segments(r.get("segments", []))
+    if top and len(rows) > top:
+        print(f"{indent}... {len(rows) - top} more (use --top 0 for all)")
+
+
+def aggregate_containers(rows: list[dict]) -> list[dict]:
+    """Sum per-process stats into per-container totals."""
+    fields = ("rss", "code_rss", "heap_rss", "stack_rss", "data_rss",
+              "shared_rss", "swap", "exe_ondisk", "file_ondisk",
+              "thp_code", "thp_data", "hugetlb_priv", "hugetlb_shared")
+    bucket: dict[str, dict] = {}
+    for r in rows:
+        key = r["container_key"]
+        c = bucket.get(key)
+        if c is None:
+            c = {"key": key, "label": r["container_label"], "procs": 0}
+            for f in fields:
+                c[f] = 0
+            bucket[key] = c
+        c["procs"] += 1
+        for f in fields:
+            c[f] += r[f]
+    # Sort: system last (it's usually largest and shadows container
+    # differences), containers by RSS descending in front of it.
+    # Sort: real containers first (by RSS desc), then the system-level
+    # buckets (system.slice, user.slice, system) at the bottom in a
+    # stable order so the "containers of interest" lead the table.
+    system_rank = {"system.slice": 1, "user.slice": 2, "system": 3}
+    return sorted(
+        bucket.values(),
+        key=lambda c: (system_rank.get(c["key"], 0), -c["rss"]),
+    )
+
+
+def _print_container_summary(containers: list[dict]) -> None:
+    print()
+    print("Per-container summary (grouped by PID namespace / cgroup)")
+    hdr = ("Container", "Procs", "RSS", "Code", "Heap", "Stack",
+           "AnonData", "Shared", "Swap", "ExeSwap", "FileSwap",
+           "THP/code", "THP/data", "HugeTLB")
+    widths = (28, 6, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12)
+    print("  " + "  ".join(f"{c:<{w}}" if i == 0 else f"{c:>{w}}"
+                            for i, (c, w) in enumerate(zip(hdr, widths))))
+    for c in containers:
+        hugetlb = c["hugetlb_priv"] + c["hugetlb_shared"]
+        vals = (
+            truncate(c["label"], 28), str(c["procs"]),
+            human(c["rss"]), human(c["code_rss"]),
+            human(c["heap_rss"]), human(c["stack_rss"]),
+            human(c["data_rss"]), human(c["shared_rss"]),
+            human(c["swap"]), human(c["exe_ondisk"]),
+            human(c["file_ondisk"]),
+            human(c["thp_code"]), human(c["thp_data"]),
+            human(hugetlb),
+        )
+        print("  " + "  ".join(f"{v:<{w}}" if i == 0 else f"{v:>{w}}"
+                                for i, (v, w) in enumerate(zip(vals, widths))))
+
+
+def print_process_details(top: int | None, show_segments: bool,
+                           group_by_container: bool) -> None:
     rows, denied, gone = collect_process_details(keep_segments=show_segments)
-
-    def trunc(rs: list[dict]) -> list[dict]:
-        return rs[:top] if top else rs
-
-    print("Per-process memory detail")
-    if not rows:
-        print("  (no processes with user memory found)")
-    else:
+    if rows:
         rows.sort(key=lambda r: r["rss"], reverse=True)
-        hdr = ("PID", "Command", "RSS", "Code", "Heap", "Stack",
-               "AnonData", "Shared", "Swap", "ExeSwap", "FileSwap",
-               "THP/code", "THP/data", "HugeTLB")
-        widths = (8, 44, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12)
-        print("  " + "  ".join(f"{c:<{w}}" if i < 2 else f"{c:>{w}}"
-                                for i, (c, w) in enumerate(zip(hdr, widths))))
-        for r in trunc(rows):
-            hugetlb = r["hugetlb_priv"] + r["hugetlb_shared"]
-            vals = (
-                str(r["pid"]),
-                truncate(r["name"], 44),
-                human(r["rss"]),
-                human(r["code_rss"]),
-                human(r["heap_rss"]),
-                human(r["stack_rss"]),
-                human(r["data_rss"]),
-                human(r["shared_rss"]),
-                human(r["swap"]),
-                human(r["exe_ondisk"]),
-                human(r["file_ondisk"]),
-                human(r["thp_code"]),
-                human(r["thp_data"]),
-                human(hugetlb),
-            )
-            print("  " + "  ".join(f"{v:<{w}}" if i < 2 else f"{v:>{w}}"
-                                    for i, (v, w) in enumerate(zip(vals, widths))))
-            if show_segments:
-                _print_segments(r.get("segments", []))
-        if top and len(rows) > top:
-            print(f"  ... {len(rows) - top} more (use --top 0 for all)")
+
+    containers = aggregate_containers(rows) if rows else []
+    # Surface the summary whenever classification split processes across
+    # more than one bucket — on a typical host that already yields
+    # system.slice / user.slice / system, which users find useful.
+    # Always show it when the user asked for the grouped view explicitly.
+    has_containers = len(containers) > 1 or group_by_container
+
+    if group_by_container and rows:
+        print("Per-process memory detail (grouped by container)")
+        for c in containers:
+            proc_rows = [r for r in rows if r["container_key"] == c["key"]]
+            hugetlb = c["hugetlb_priv"] + c["hugetlb_shared"]
+            header_bits = [
+                f"procs={c['procs']}",
+                f"RSS={human(c['rss'])}",
+                f"swap={human(c['swap'])}",
+                f"shared={human(c['shared_rss'])}",
+            ]
+            if hugetlb:
+                header_bits.append(f"hugetlb={human(hugetlb)}")
+            print(f"\n  [{c['label']}]  " + "  ".join(header_bits))
+            _print_process_table(proc_rows, top, show_segments, indent="    ")
+    else:
+        print("Per-process memory detail")
+        if not rows:
+            print("  (no processes with user memory found)")
+        else:
+            _print_process_table(rows, top, show_segments, indent="  ")
+
+    if has_containers:
+        _print_container_summary(containers)
 
     _print_hugetlb_table(rows, top)
     _print_proc_notes(denied, gone)
@@ -631,6 +876,31 @@ Per-process shared segments (--shared)
               rw-p = private read-write).
   path        Backing file or [heap] / [stack] / (anon) / /memfd:...
 
+Per-container summary (automatic when > 1 bucket exists; always with --containers)
+-----------------------------------------------------------------------------------
+Each process lands in exactly one bucket based on its cgroup path. Priority order:
+
+  1. /container/<runtime>/<id>[/...]   → '<runtime>:<id>'   (custom cgroup-based layouts such
+                                                              as Weka's /container/weka/default0)
+  2. Known runtime patterns in the cgroup (docker, podman/libpod, kubepods, crio, containerd,
+     lxc, systemd-nspawn)              → '<runtime>:<id>'
+  3. /system.slice/*                   → 'system.slice'     (one bucket; all systemd services)
+  4. /user.slice/*                     → 'user.slice'       (one bucket; all user sessions)
+  5. everything else (/, /init.scope,  → 'system'
+     /system, unreadable cgroup, ...)
+
+A separate PID namespace alone is not treated as a container — browser sandboxes each create their
+own pid ns and would otherwise flood the view.
+
+The summary prints automatically whenever at least two buckets have processes. Run with
+--containers to also group the per-process listing under each bucket's header.
+
+  Container      Bucket label as listed above.
+  Procs          Number of processes aggregated into this row.
+  RSS ... HugeTLB  Same semantics as the per-process columns, summed across the bucket's processes.
+                   Memory numbers come from smaps (not cgroup memory.stat) so they are consistent with
+                   the per-process view and do not rely on any in-container accounting.
+
 NUMA hugepage breakdown (--numa)
 --------------------------------
   Same columns as the HugeTLB table but pulled from /sys/devices/system/node/nodeN. The kernel does
@@ -671,8 +941,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="show per-process memory breakdown (RSS, code, heap, stack, THP, hugetlb)")
     ap.add_argument("--shared", action="store_true",
                     help="list each process's top shared segments (implies --procs)")
+    ap.add_argument("--containers", action="store_true",
+                    help="group the per-process listing by container (implies --procs); "
+                         "the container summary is always printed when containers are detected")
     ap.add_argument("--top", type=int, default=15, metavar="N",
-                    help="with --procs, show only top N processes (0 = all)")
+                    help="with --procs, show only top N processes "
+                         "(per container when --containers is set; 0 = all)")
     ap.add_argument("--no-thp", action="store_true",
                     help="hide transparent hugepage counters")
     ap.add_argument("--no-directmap", action="store_true",
@@ -696,8 +970,10 @@ def main(argv: list[str] | None = None) -> int:
         print_numa(collect_numa_hugepages())
     if not args.no_thp:
         print_thp(mem)
-    if args.procs or args.shared:
-        print_process_details(args.top or None, show_segments=args.shared)
+    if args.procs or args.shared or args.containers:
+        print_process_details(args.top or None,
+                               show_segments=args.shared,
+                               group_by_container=args.containers)
     if not args.no_directmap:
         print_directmap(mem)
     return 0

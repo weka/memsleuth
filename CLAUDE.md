@@ -11,6 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ./memsleuth.py --procs          # add per-process memory breakdown
 ./memsleuth.py --shared         # also list top shared VMAs under each process
 ./memsleuth.py --numa           # split hugepage pools by NUMA node
+./memsleuth.py --containers     # group per-process listing by container runtime
 ./memsleuth.py --help-fields    # long-form reference for every output column
 sudo ./memsleuth.py --procs     # needed to attribute memory for other users' processes
 ```
@@ -47,6 +48,20 @@ All logic lives in `memsleuth.py`. The flow is **collect → aggregate → print
 - When `keep_segments=True`, segments with `≥ SEGMENT_MIN_SHARED` shared bytes are kept, merged by `(path, perms)` so one file's `r-xp` / `r--p` / `rw-p` ranges show as separate logical rows.
 
 `~sharers` in the shared-segment output is approximated as `round(Rss / Pss)` per VMA. The kernel doesn't directly expose how many processes map a region; `Pss` gives us that for free.
+
+### Container classification
+
+`classify_container(pid)` reads `/proc/<pid>/cgroup` via `read_cgroup_info`, which returns **every** hierarchy's path plus a "primary" (v2 unified, else v1 memory/pids). Container detection scans all paths — this matters for runtimes that pin the container id on a **named v1 hierarchy** (e.g. Weka writes `name=weka:/container/weka/default3` while the memory/pids/unified controllers all point at `/system.slice/weka-agent.service`). Looking only at the unified line silently misidentifies every such process as `system.slice`. The structural `system.slice` / `user.slice` / `system` buckets (steps 3–5 below) use only the primary path. Priority:
+
+1. `/container/<runtime>/<id>[/...]` → `<runtime>:<id>` — catches Weka's custom layout (`/container/weka/default0` etc.); deeper sub-cgroups inside a container collapse into the same bucket via `CONTAINER_SLOT_RE` capturing the first two segments.
+2. `CGROUP_PATTERNS` against the cgroup path: docker, podman/libpod, kubepods, crio, containerd, lxc, systemd-nspawn (`machine-*.scope`). Labelled `<runtime>:<id>`.
+3. `/system.slice/*` → one `system.slice` bucket (all systemd services grouped).
+4. `/user.slice/*` → one `user.slice` bucket (all user sessions grouped — we intentionally do not split by UID because the typical ask is "host vs. containers", not per-user rollups).
+5. Everything else (`/`, `/init.scope`, unreadable cgroup) → `system`.
+
+`pid_namespace_inode` and `host_pid_namespace` are present but deliberately not the primary signal: browser sandboxes each get their own PID namespace and treating every sandbox as a container drowns the real ones in noise. The helpers remain for a potential future flag that surfaces raw namespace splits.
+
+Summary gate (`has_containers`) triggers when classification produced more than one bucket, or when `--containers` was explicitly requested. All per-container numbers are summed from our own smaps data — the tool never reads cgroup memory accounting, so numbers are consistent with the per-process view and don't depend on in-container instrumentation. Bucket ordering in the summary places real containers first (by RSS desc) and pushes `system.slice` / `user.slice` / `system` to the end in that fixed order, keeping the interesting rows at the top.
 
 ### Formatting conventions
 

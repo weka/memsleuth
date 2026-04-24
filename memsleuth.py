@@ -7,20 +7,29 @@ total/free/reserved/surplus counts. Optionally breaks the hugepage pools
 down per NUMA node.
 """
 
-from __future__ import annotations
-
 import argparse
 import os
 import re
 import sys
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Pattern, Tuple, Union
 
 HUGEPAGES_ROOT = Path("/sys/kernel/mm/hugepages")
 NUMA_ROOT = Path("/sys/devices/system/node")
 MEMINFO = Path("/proc/meminfo")
+BUDDYINFO = Path("/proc/buddyinfo")
+PAGETYPEINFO = Path("/proc/pagetypeinfo")
 PROC = Path("/proc")
 
-_ONLINE_NUMA_NODES_CACHE: list[list[int]] = []
+# Migration-type pools from which a 2 MiB (or larger) allocation can
+# usually succeed without compaction. Unmovable blocks of the right
+# size *might* satisfy a hugepage request but may require migrating
+# in-use kernel pages out of the way, which can fail.
+MOVABLE_MTYPES = {"Movable", "Reclaimable", "CMA"}
+
+_BASE_PAGE_SIZE_CACHE: List[int] = []
+
+_ONLINE_NUMA_NODES_CACHE: List[List[int]] = []
 
 PROC_HP_FIELDS = ("AnonHugePages", "ShmemPmdMapped", "FilePmdMapped",
                   "Shared_Hugetlb", "Private_Hugetlb")
@@ -58,9 +67,9 @@ def human(nbytes: int, *, zero: str = "0 B") -> str:
     return f"{'-' if neg else ''}{n} B"
 
 
-def parse_meminfo(path: Path = MEMINFO) -> dict[str, int]:
+def parse_meminfo(path: Path = MEMINFO) -> Dict[str, int]:
     """Return /proc/meminfo as a dict of name -> bytes."""
-    fields: dict[str, int] = {}
+    fields: Dict[str, int] = {}
     for line in path.read_text().splitlines():
         m = re.match(r"([^:]+):\s+(\d+)(?:\s+(\w+))?", line)
         if not m:
@@ -79,13 +88,13 @@ def read_int(path: Path) -> int:
         return 0
 
 
-def hugepage_size_from_dirname(name: str) -> int | None:
+def hugepage_size_from_dirname(name: str) -> Optional[int]:
     """`hugepages-2048kB` -> 2048 * 1024 bytes."""
     m = re.match(r"hugepages-(\d+)kB$", name)
     return int(m.group(1)) * 1024 if m else None
 
 
-def collect_hugepages(root: Path = HUGEPAGES_ROOT) -> list[dict]:
+def collect_hugepages(root: Path = HUGEPAGES_ROOT) -> List[dict]:
     """Read all configured hugepage sizes from sysfs.
 
     Each entry: {size, nr, free, resv, surplus, overcommit}. Counts are
@@ -109,11 +118,189 @@ def collect_hugepages(root: Path = HUGEPAGES_ROOT) -> list[dict]:
     return pools
 
 
-def collect_numa_hugepages(root: Path = NUMA_ROOT) -> dict[int, list[dict]]:
+def base_page_size() -> int:
+    """Kernel base page size (usually 4096). Cached."""
+    if not _BASE_PAGE_SIZE_CACHE:
+        try:
+            _BASE_PAGE_SIZE_CACHE.append(int(os.sysconf("SC_PAGE_SIZE")))
+        except (ValueError, OSError):
+            _BASE_PAGE_SIZE_CACHE.append(4096)
+    return _BASE_PAGE_SIZE_CACHE[0]
+
+
+def _buddy_count(tok: str) -> int:
+    """Parse one free-count cell from buddyinfo / pagetypeinfo.
+
+    The kernel caps very large free counts with a '>' prefix (e.g.
+    '>100000' — see MAX_LINE_LEN handling in mm/vmstat.c) to keep the
+    column width sane. Treat that as the bare number; it's a lower
+    bound, which is still sound for 'how many hugepages could I get'.
+    """
+    if tok.startswith(">"):
+        tok = tok[1:]
+    try:
+        return int(tok)
+    except ValueError:
+        return 0
+
+
+def parse_buddyinfo() -> Dict[int, Dict[str, List[int]]]:
+    """Parse /proc/buddyinfo: ``{node_id: {zone: [count_at_order_0, ...]}}``.
+
+    Each row's columns are the per-order free block counts in the
+    buddy allocator. Total across zones and migration types is what
+    ``MemFree`` in /proc/meminfo would tell you; the order-by-order
+    breakdown is what matters for hugepage availability.
+    """
+    try:
+        text = BUDDYINFO.read_text()
+    except OSError:
+        return {}
+    result: Dict[int, Dict[str, List[int]]] = {}
+    for line in text.splitlines():
+        m = re.match(r"Node\s+(\d+),\s+zone\s+(\S+)\s+(.+)$", line)
+        if not m:
+            continue
+        node = int(m.group(1))
+        zone = m.group(2)
+        counts = [_buddy_count(x) for x in m.group(3).split()]
+        result.setdefault(node, {})[zone] = counts
+    return result
+
+
+def parse_pagetypeinfo() -> Dict[int, Dict[str, Dict[str, List[int]]]]:
+    """Parse /proc/pagetypeinfo's per-migration-type free-area section.
+
+    Returns ``{node: {zone: {migration_type: [counts_by_order]}}}``.
+    Migration types are Unmovable / Movable / Reclaimable / HighAtomic /
+    CMA / Isolate. The header and the trailing 'Number of blocks' block
+    are ignored because their lines don't match the regex.
+    """
+    try:
+        text = PAGETYPEINFO.read_text()
+    except OSError:
+        return {}
+    result: Dict[int, Dict[str, Dict[str, List[int]]]] = {}
+    for line in text.splitlines():
+        m = re.match(r"Node\s+(\d+),\s+zone\s+(\S+),\s+type\s+(\S+)\s+(.+)$", line)
+        if not m:
+            continue
+        node = int(m.group(1))
+        zone = m.group(2)
+        mtype = m.group(3)
+        counts = [_buddy_count(x) for x in m.group(4).split()]
+        result.setdefault(node, {}).setdefault(zone, {})[mtype] = counts
+    return result
+
+
+def parse_pagetypeinfo_blocks() -> Tuple[Dict[int, Dict[str, Dict[str, int]]], int]:
+    """Parse /proc/pagetypeinfo's 'Number of blocks type' section.
+
+    Returns ``(blocks, pageblock_size)`` where ``blocks[node][zone][mtype]``
+    is the count of pageblocks of that migration type. The pageblock
+    size (in bytes) is derived from the file header's ``Pages per
+    block: N`` line — typically 2 MiB on x86_64 with 4 KiB base pages.
+
+    For hugepage sizes the buddy allocator can't express (1 GiB), this
+    section gives a tighter upper bound than MemFree alone: to allocate
+    an N GiB hugepage the kernel needs N GiB / pageblock_size
+    consecutive pageblocks that are all migratable. The count is still
+    optimistic (we don't know that they're actually contiguous), but
+    it's closer to what ``__alloc_contig_pages`` can actually deliver.
+    """
+    try:
+        text = PAGETYPEINFO.read_text()
+    except OSError:
+        return {}, 0
+    blocks: Dict[int, Dict[str, Dict[str, int]]] = {}
+    types: Optional[List[str]] = None
+    pages_per_block = 0
+    for line in text.splitlines():
+        m_hdr = re.match(r"Pages per block:\s+(\d+)", line)
+        if m_hdr:
+            pages_per_block = int(m_hdr.group(1))
+            continue
+        if line.startswith("Number of blocks type"):
+            types = line.split()[4:]
+            continue
+        if types is None:
+            # still inside the free-area section; skip
+            continue
+        # Block-count rows don't have ", type X" after the zone.
+        m = re.match(r"Node\s+(\d+),\s+zone\s+(\S+)\s+(.+)$", line)
+        if not m or ", type" in line:
+            continue
+        counts = [_buddy_count(x) for x in m.group(3).split()[:len(types)]]
+        if len(counts) < len(types):
+            continue
+        node = int(m.group(1))
+        zone = m.group(2)
+        per_zone = blocks.setdefault(node, {}).setdefault(zone, {})
+        for t, c in zip(types, counts):
+            per_zone[t] = c
+    pageblock_size = pages_per_block * base_page_size() if pages_per_block else 0
+    return blocks, pageblock_size
+
+
+def hugepage_availability_all(
+    buddy: Dict[int, Dict[str, List[int]]],
+    hugepage_order: int,
+) -> Dict[int, Dict[str, int]]:
+    """Per-node total free blocks at order ≥ hugepage_order, across all
+    zones and migration types. Larger-order blocks contribute multiple
+    hugepages (an order-K block splits into ``2**(K - hugepage_order)``).
+    """
+    result: Dict[int, Dict[str, int]] = {}
+    for node, zones in buddy.items():
+        total = 0
+        max_order = -1
+        for counts in zones.values():
+            if hugepage_order >= len(counts):
+                continue
+            for order in range(hugepage_order, len(counts)):
+                n = counts[order]
+                if n and order > max_order:
+                    max_order = order
+                total += n * (1 << (order - hugepage_order))
+        result[node] = {"all": total, "max_order": max_order}
+    return result
+
+
+def hugepage_availability_safe(
+    pagetype: Dict[int, Dict[str, Dict[str, List[int]]]],
+    hugepage_order: int,
+) -> Dict[int, int]:
+    """Per-node count from movable-ish (Movable/Reclaimable/CMA) pools
+    only — pages that can be allocated without relocating kernel data.
+    Returns {} when pagetypeinfo wasn't readable (needs root)."""
+    result: Dict[int, int] = {}
+    for node, zones in pagetype.items():
+        total = 0
+        for per_mtype in zones.values():
+            for mtype, counts in per_mtype.items():
+                if mtype not in MOVABLE_MTYPES or hugepage_order >= len(counts):
+                    continue
+                for order in range(hugepage_order, len(counts)):
+                    total += counts[order] * (1 << (order - hugepage_order))
+        result[node] = total
+    return result
+
+
+def buddy_max_order(buddy: dict) -> int:
+    """Highest buddy order exposed by this kernel (MAX_ORDER - 1)."""
+    mo = -1
+    for zones in buddy.values():
+        for counts in zones.values():
+            if len(counts) - 1 > mo:
+                mo = len(counts) - 1
+    return mo
+
+
+def collect_numa_hugepages(root: Path = NUMA_ROOT) -> Dict[int, List[dict]]:
     """Per-NUMA-node hugepage stats: {node_id: [pool, ...]}."""
     if not root.is_dir():
         return {}
-    nodes: dict[int, list[dict]] = {}
+    nodes: Dict[int, List[dict]] = {}
     for entry in sorted(root.iterdir()):
         m = re.match(r"node(\d+)$", entry.name)
         if not m:
@@ -138,7 +325,7 @@ def collect_numa_hugepages(root: Path = NUMA_ROOT) -> dict[int, list[dict]]:
     return nodes
 
 
-def print_free(mem: dict[str, int]) -> None:
+def print_free(mem: Dict[str, int]) -> None:
     total = mem.get("MemTotal", 0)
     free = mem.get("MemFree", 0)
     available = mem.get("MemAvailable", 0)
@@ -159,7 +346,7 @@ def print_free(mem: dict[str, int]) -> None:
     print()
 
 
-def print_hugetlb(pools: list[dict]) -> None:
+def print_hugetlb(pools: List[dict]) -> None:
     print("HugeTLB Pages (explicit hugepage pools)")
     if not pools:
         print("  (no hugepage sizes configured)")
@@ -197,7 +384,119 @@ def print_hugetlb(pools: list[dict]) -> None:
     print()
 
 
-def print_numa(nodes: dict[int, list[dict]]) -> None:
+def print_hugepage_capacity(pools: List[dict],
+                             numa_hugetlb: Dict[int, List[dict]]) -> None:
+    """Per-NUMA "can I allocate a hugepage right now?" table.
+
+    Columns:
+      Pool free/total - persistent pool (from /sys/.../hugepages-*kB/).
+      Buddy safe      - free pages in Movable/Reclaimable/CMA pools at
+                        order ≥ hp_order, allocatable without
+                        compacting kernel data. Requires
+                        /proc/pagetypeinfo (root-only); shows 'needs
+                        root' otherwise.
+      Buddy max       - free pages across all migration types. From
+                        /proc/buddyinfo (world-readable).
+
+    Sizes the buddy allocator can't represent (typically 1 GiB, since
+    MAX_ORDER is usually 10 → 4 MiB cap) show 'pool only' — these
+    come from the persistent pool or hugetlb_cma only, not from
+    runtime allocation.
+    """
+    if not pools:
+        return
+    buddy = parse_buddyinfo()
+    pagetype = parse_pagetypeinfo()
+    _, pageblock_size = parse_pagetypeinfo_blocks()
+    if not pageblock_size and pools:
+        # Fallback: the smallest configured hugepage equals the pageblock
+        # on kernels we care about (x86_64 with HUGETLB_PAGE_ORDER == 9).
+        pageblock_size = min(p["size"] for p in pools)
+    base = base_page_size()
+    max_order = buddy_max_order(buddy) if buddy else -1
+    # Order of a pageblock; used to scale free-block counts down to the
+    # unit we care about for buddy-inexpressible hugepage sizes.
+    pageblock_order = -1
+    if base and pageblock_size:
+        ratio = pageblock_size // base
+        if ratio > 0 and (ratio & (ratio - 1)) == 0:
+            pageblock_order = ratio.bit_length() - 1
+
+    pool_by_size: Dict[Tuple[int, int], dict] = {}
+    for node_id, node_pools in numa_hugetlb.items():
+        for p in node_pools:
+            pool_by_size[(p["size"], node_id)] = p
+
+    print("Hugepage allocation capacity")
+    print("  (pool = persistent hugepage pool; buddy = free blocks big enough in the page allocator)")
+    hdr = ("Size", "Node", "Pool free", "Pool total", "Buddy safe", "Buddy max")
+    widths = (10, 8, 11, 11, 22, 22)
+    print("  " + "  ".join(f"{h:<{w}}" if i < 2 else f"{h:>{w}}"
+                            for i, (h, w) in enumerate(zip(hdr, widths))))
+
+    nodes_present = sorted(
+        numa_hugetlb.keys() | buddy.keys() | (pagetype.keys() if pagetype else set())
+    )
+    if not nodes_present:
+        nodes_present = [0]
+
+    for pool in pools:
+        hp_size = pool["size"]
+        ratio = hp_size // base if base else 0
+        is_power_of_two = ratio > 0 and (ratio & (ratio - 1)) == 0
+        hp_order = ratio.bit_length() - 1 if is_power_of_two else -1
+        can_buddy = 0 <= hp_order <= max_order
+
+        avail_all = hugepage_availability_all(buddy, hp_order) if can_buddy else {}
+        avail_safe = hugepage_availability_safe(pagetype, hp_order) if (can_buddy and pagetype) else {}
+
+        for node in nodes_present:
+            pnode = pool_by_size.get((hp_size, node))
+            pool_free = str(pnode["free"]) if pnode else "—"
+            pool_total = str(pnode["nr"] + pnode["surplus"]) if pnode else "—"
+            if not can_buddy:
+                # The buddy allocator can't produce this size directly,
+                # but the kernel still attempts compaction + migration
+                # when nr_hugepages is increased. Estimate capacity at
+                # the pageblock order (typically 2 MiB on x86_64) and
+                # divide by blocks_per_hp, since every 1 GiB hugepage
+                # needs blocks_per_hp consecutive migratable pageblocks
+                # — this tracks fragmentation reality and is also
+                # consistent with the smaller-size row (can never
+                # exceed the smaller-row count divided by blocks_per_hp).
+                blocks_per_hp = hp_size // pageblock_size if pageblock_size else 0
+                if pageblock_order <= 0 or blocks_per_hp <= 0:
+                    safe_str = "pool only"
+                    all_str = "pool only"
+                else:
+                    pb_all = hugepage_availability_all(buddy, pageblock_order).get(
+                        node, {"all": 0}
+                    )["all"]
+                    all_est = pb_all // blocks_per_hp
+                    all_str = (f"≤{all_est:,} (from {pb_all:,} 2M free)"
+                                if pb_all else "0 (no 2M free)")
+                    if pagetype:
+                        pb_safe = hugepage_availability_safe(pagetype, pageblock_order).get(node, 0)
+                        safe_est = pb_safe // blocks_per_hp
+                        safe_str = (f"≤{safe_est:,} ({pb_safe:,} movable)"
+                                    if pb_safe else "0 (no movable)")
+                    else:
+                        safe_str = "needs root"
+            else:
+                a = avail_all.get(node, {"all": 0})["all"]
+                all_str = f"{a:,} ({human(a * hp_size)})"
+                if pagetype:
+                    s = avail_safe.get(node, 0)
+                    safe_str = f"{s:,} ({human(s * hp_size)})"
+                else:
+                    safe_str = "needs root"
+            vals = (human(hp_size), f"node{node}", pool_free, pool_total, safe_str, all_str)
+            print("  " + "  ".join(f"{v:<{w}}" if i < 2 else f"{v:>{w}}"
+                                    for i, (v, w) in enumerate(zip(vals, widths))))
+    print()
+
+
+def print_numa(nodes: Dict[int, List[dict]]) -> None:
     if not nodes:
         return
     print("HugeTLB Pages per NUMA node")
@@ -250,7 +549,7 @@ def categorize_vma(path: str, perms: str) -> str:
     return "shmem" if "s" in perms else "anon"
 
 
-def parse_smaps(pid: str) -> tuple[list[dict] | None, str | None]:
+def parse_smaps(pid: str) -> Tuple[Optional[List[dict]], Optional[str]]:
     """Parse /proc/<pid>/smaps. Returns (entries, error).
 
     error is None on success, "gone" if the process vanished or is a
@@ -268,8 +567,8 @@ def parse_smaps(pid: str) -> tuple[list[dict] | None, str | None]:
     except OSError:
         return None, "gone"
 
-    entries: list[dict] = []
-    current: dict | None = None
+    entries: List[dict] = []
+    current: Optional[dict] = None
     for line in text.splitlines():
         m = SMAPS_HEADER_RE.match(line)
         if m:
@@ -298,7 +597,7 @@ def parse_smaps(pid: str) -> tuple[list[dict] | None, str | None]:
     return entries, None
 
 
-def online_numa_nodes() -> list[int]:
+def online_numa_nodes() -> List[int]:
     """Return the list of online NUMA node IDs, cached.
 
     Parses /sys/devices/system/node/online (kernel's cpulist syntax:
@@ -307,7 +606,7 @@ def online_numa_nodes() -> list[int]:
     """
     if _ONLINE_NUMA_NODES_CACHE:
         return _ONLINE_NUMA_NODES_CACHE[0]
-    nodes: list[int] = []
+    nodes: List[int] = []
     online_file = NUMA_ROOT / "online"
     try:
         text = online_file.read_text().strip()
@@ -331,7 +630,7 @@ def online_numa_nodes() -> list[int]:
     return nodes
 
 
-def parse_numa_maps(pid: str) -> dict[int, dict] | None:
+def parse_numa_maps(pid: str) -> Optional[Dict[int, dict]]:
     """Parse /proc/<pid>/numa_maps into ``{vma_start: info}``.
 
     ``info`` is ``{"nodes": {node_id: bytes}, "huge": bool}``. The
@@ -351,7 +650,7 @@ def parse_numa_maps(pid: str) -> dict[int, dict] | None:
         return None
     except OSError:
         return None
-    result: dict[int, dict] = {}
+    result: Dict[int, dict] = {}
     for line in text.splitlines():
         parts = line.split()
         if not parts:
@@ -361,7 +660,7 @@ def parse_numa_maps(pid: str) -> dict[int, dict] | None:
         except ValueError:
             continue
         page_kb = 4
-        raw: list[tuple[int, int]] = []
+        raw: List[Tuple[int, int]] = []
         is_huge = False
         for tok in parts[1:]:
             if tok == "huge":
@@ -380,7 +679,7 @@ def parse_numa_maps(pid: str) -> dict[int, dict] | None:
         if not raw:
             continue
         scale = page_kb * 1024
-        per_node: dict[int, int] = {}
+        per_node: Dict[int, int] = {}
         for node, count in raw:
             per_node[node] = per_node.get(node, 0) + count * scale
         result[addr] = {"nodes": per_node, "huge": is_huge}
@@ -401,7 +700,7 @@ def compact_size(nbytes: int) -> str:
     return str(nbytes)
 
 
-def format_numa_rss(per_node: dict[int, int], nodes: list[int]) -> str:
+def format_numa_rss(per_node: Dict[int, int], nodes: List[int]) -> str:
     """``N0/N1/N2/...`` compact per-node RSS string."""
     return "/".join(compact_size(per_node.get(n, 0)) for n in nodes)
 
@@ -443,7 +742,7 @@ def truncate(s: str, width: int) -> str:
 
 # Ordered: most specific patterns first so kubepods wins over the inner
 # runc scope it wraps.
-CGROUP_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+CGROUP_PATTERNS: List[Tuple[Pattern[str], str]] = [
     (re.compile(r"/kubepods[.\-/].*?(?:pod)?([0-9a-f]{8}[-_][0-9a-f]{4,}[^/]*)"), "k8s"),
     (re.compile(r"/kubepods[.\-/]"), "k8s"),
     (re.compile(r"docker[-/]([0-9a-f]{12,64})"), "docker"),
@@ -454,10 +753,10 @@ CGROUP_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"machine-([^./]+)\.scope"), "nspawn"),
 ]
 
-_HOST_NS_CACHE: list[int | None] = []
+_HOST_NS_CACHE: List[Optional[int]] = []
 
 
-def pid_namespace_inode(pid: str) -> int | None:
+def pid_namespace_inode(pid: str) -> Optional[int]:
     """Return the nsfs inode of /proc/<pid>/ns/pid, or None if unreadable.
 
     The symlink target format is ``pid:[4026531836]``; the bracketed
@@ -473,7 +772,7 @@ def pid_namespace_inode(pid: str) -> int | None:
         return None
 
 
-def host_pid_namespace() -> int | None:
+def host_pid_namespace() -> Optional[int]:
     """The PID namespace inode of the memsleuth process itself.
 
     Cached because it's invariant for the run. We use /proc/self because
@@ -485,7 +784,7 @@ def host_pid_namespace() -> int | None:
     return _HOST_NS_CACHE[0]
 
 
-def read_cgroup_info(pid: str) -> tuple[list[str], str | None]:
+def read_cgroup_info(pid: str) -> Tuple[List[str], Optional[str]]:
     """Parse /proc/<pid>/cgroup once. Return (all_paths, primary_path).
 
     all_paths is every hierarchy's path (v2 unified, v1 controllers,
@@ -506,9 +805,9 @@ def read_cgroup_info(pid: str) -> tuple[list[str], str | None]:
         text = (PROC / pid / "cgroup").read_text()
     except OSError:
         return [], None
-    all_paths: list[str] = []
-    unified: str | None = None
-    v1_fallback: str | None = None
+    all_paths: List[str] = []
+    unified: Optional[str] = None
+    v1_fallback: Optional[str] = None
     for line in text.splitlines():
         parts = line.strip().split(":", 2)
         if len(parts) != 3:
@@ -522,7 +821,7 @@ def read_cgroup_info(pid: str) -> tuple[list[str], str | None]:
     return all_paths, unified or v1_fallback
 
 
-def container_label_from_cgroup(path: str | None) -> str | None:
+def container_label_from_cgroup(path: Optional[str]) -> Optional[str]:
     if not path:
         return None
     for pattern, kind in CGROUP_PATTERNS:
@@ -540,7 +839,7 @@ def container_label_from_cgroup(path: str | None) -> str | None:
 CONTAINER_SLOT_RE = re.compile(r"^/container/([^/]+)(?:/([^/]+))?")
 
 
-def classify_container(pid: str) -> tuple[str, str]:
+def classify_container(pid: str) -> Tuple[str, str]:
     """Return (group_key, label).
 
     Buckets in priority order:
@@ -608,8 +907,8 @@ NUMA_FIELDS = ("rss", "code_rss", "heap_rss", "stack_rss",
                "data_rss", "shared_rss", "hugetlb")
 
 
-def aggregate_process(entries: list[dict], keep_segments: bool = False,
-                      numa_data: dict[int, dict] | None = None) -> dict:
+def aggregate_process(entries: List[dict], keep_segments: bool = False,
+                      numa_data: Optional[Dict[int, dict]] = None) -> dict:
     """Roll VMA entries up into a per-process summary.
 
     When keep_segments is True, also return a `segments` list of the
@@ -623,8 +922,8 @@ def aggregate_process(entries: list[dict], keep_segments: bool = False,
         "hugetlb_priv": 0, "hugetlb_shared": 0,
         "swap": 0, "exe_ondisk": 0, "file_ondisk": 0,
     }
-    segments: list[dict] = [] if keep_segments else []
-    numa: dict[str, dict[int, int]] = {f: {} for f in NUMA_FIELDS} if numa_data is not None else {}
+    segments: List[dict] = [] if keep_segments else []
+    numa: Dict[str, Dict[int, int]] = {f: {} for f in NUMA_FIELDS} if numa_data is not None else {}
 
     def _add(bucket: str, node: int, amount: int) -> None:
         d = numa[bucket]
@@ -699,7 +998,7 @@ def aggregate_process(entries: list[dict], keep_segments: bool = False,
         # Merge segments with the same path + perms — a single file is
         # often split across several VMAs (rodata, code) at different
         # offsets, and the user wants one line per logical region.
-        merged: dict[tuple[str, str], dict] = {}
+        merged: Dict[Tuple[str, str], dict] = {}
         for s in segments:
             key = (s["path"], s["perms"])
             if key in merged:
@@ -718,13 +1017,13 @@ def aggregate_process(entries: list[dict], keep_segments: bool = False,
 
 
 def collect_process_details(keep_segments: bool = False,
-                              include_numa: bool = False) -> tuple[list[dict], int, int]:
+                              include_numa: bool = False) -> Tuple[List[dict], int, int]:
     """Walk /proc scanning smaps. Returns (rows, denied, kernel_threads).
 
     When ``include_numa`` is True, each row also carries a
     ``numa_rss`` dict {node_id: bytes} parsed from /proc/<pid>/numa_maps.
     """
-    rows: list[dict] = []
+    rows: List[dict] = []
     denied = 0
     gone = 0
     for entry in PROC.iterdir():
@@ -767,9 +1066,9 @@ PROC_TABLE_HDR = ("PID", "Command", "RSS", "Code", "Heap", "Stack",
 PROC_TABLE_WIDTHS = (8, 44, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12)
 
 
-def _print_process_table(rows: list[dict], top: int | None,
+def _print_process_table(rows: List[dict], top: Optional[int],
                           show_segments: bool, indent: str,
-                          numa_nodes: list[int] | None = None) -> None:
+                          numa_nodes: Optional[List[int]] = None) -> None:
     print(indent + "  ".join(f"{c:<{w}}" if i < 2 else f"{c:>{w}}"
                               for i, (c, w) in enumerate(
                                   zip(PROC_TABLE_HDR, PROC_TABLE_WIDTHS))))
@@ -797,7 +1096,7 @@ def _print_process_table(rows: list[dict], top: int | None,
         print(f"{indent}... {len(rows) - top} more (use --top 0 for all)")
 
 
-def _print_numa_subrows(row: dict, nodes: list[int], indent: str) -> None:
+def _print_numa_subrows(row: dict, nodes: List[int], indent: str) -> None:
     """Emit one ``N<id>`` sub-row per NUMA node with per-category bytes.
 
     The node label sits in the Command column so each sub-row reads as
@@ -833,12 +1132,12 @@ def _print_numa_subrows(row: dict, nodes: list[int], indent: str) -> None:
                                       zip(vals, PROC_TABLE_WIDTHS))))
 
 
-def aggregate_containers(rows: list[dict]) -> list[dict]:
+def aggregate_containers(rows: List[dict]) -> List[dict]:
     """Sum per-process stats into per-container totals."""
     fields = ("rss", "code_rss", "heap_rss", "stack_rss", "data_rss",
               "shared_rss", "swap", "exe_ondisk", "file_ondisk",
               "thp_code", "thp_data", "hugetlb_priv", "hugetlb_shared")
-    bucket: dict[str, dict] = {}
+    bucket: Dict[str, dict] = {}
     for r in rows:
         key = r["container_key"]
         c = bucket.get(key)
@@ -862,7 +1161,7 @@ def aggregate_containers(rows: list[dict]) -> list[dict]:
     )
 
 
-def _print_container_summary(containers: list[dict]) -> None:
+def _print_container_summary(containers: List[dict]) -> None:
     print()
     print("Per-container summary (grouped by PID namespace / cgroup)")
     hdr = ("Container", "Procs", "RSS", "Code", "Heap", "Stack",
@@ -887,7 +1186,7 @@ def _print_container_summary(containers: list[dict]) -> None:
                                 for i, (v, w) in enumerate(zip(vals, widths))))
 
 
-def print_process_details(top: int | None, show_segments: bool,
+def print_process_details(top: Optional[int], show_segments: bool,
                            group_by_container: bool,
                            show_numa: bool = False) -> None:
     numa_nodes = online_numa_nodes() if show_numa else []
@@ -938,7 +1237,7 @@ def print_process_details(top: int | None, show_segments: bool,
     _print_proc_notes(denied, gone)
 
 
-def _print_segments(segments: list[dict]) -> None:
+def _print_segments(segments: List[dict]) -> None:
     if not segments:
         return
     shown = segments[:SEGMENTS_PER_PROCESS]
@@ -959,7 +1258,7 @@ def _print_segments(segments: list[dict]) -> None:
         print(f"      ... {len(segments) - SEGMENTS_PER_PROCESS} more segments")
 
 
-def _print_hugetlb_table(rows: list[dict], top: int | None) -> None:
+def _print_hugetlb_table(rows: List[dict], top: Optional[int]) -> None:
     hugetlb_rows = [r for r in rows if r["hugetlb_priv"] or r["hugetlb_shared"]]
     if not hugetlb_rows:
         return
@@ -993,7 +1292,7 @@ def _print_proc_notes(denied: int, gone: int) -> None:
     print()
 
 
-def print_thp(mem: dict[str, int]) -> None:
+def print_thp(mem: Dict[str, int]) -> None:
     """Transparent/implicit huge pages — already counted inside MemUsed."""
     anon = mem.get("AnonHugePages", 0)
     shmem = mem.get("ShmemHugePages", 0)
@@ -1013,7 +1312,7 @@ def print_thp(mem: dict[str, int]) -> None:
     print()
 
 
-def print_directmap(mem: dict[str, int]) -> None:
+def print_directmap(mem: Dict[str, int]) -> None:
     keys = [k for k in mem if k.startswith("DirectMap")]
     if not keys:
         return
@@ -1050,6 +1349,54 @@ HugeTLB Pages (explicit hugepage pool, per size)
   Used        (Total + Surplus) - Free.
   Mem Used    Used * Size, in bytes.
   Mem Free    Free * Size, in bytes.
+
+Hugepage allocation capacity (always shown when any pool size is configured)
+----------------------------------------------------------------------------
+Per-NUMA answer to "could I allocate a hugepage right now, and how many?"
+
+  Pool free / Pool total  /sys/kernel/mm/hugepages-*kB/{free,nr}_hugepages per node
+                          (plus surplus). Already reserved, immediately usable.
+  Buddy safe              Free blocks of order ≥ the hugepage order, in
+                          Movable / Reclaimable / CMA migration pools. These
+                          are allocatable without migrating in-use kernel
+                          data. Pulled from /proc/pagetypeinfo — root-only;
+                          renders as 'needs root' otherwise.
+  Buddy max               Free blocks at the right order summed across ALL
+                          migration types (Unmovable included). The extra
+                          pages beyond 'Buddy safe' may require compaction/
+                          migration and are not guaranteed to succeed. From
+                          /proc/buddyinfo (world-readable).
+
+Larger-order free blocks contribute multiple hugepages — an order-K block
+satisfies ``2**(K - hp_order)`` hugepages of the target size, since the
+kernel can split it.
+
+Sizes beyond MAX_ORDER × base-page-size (typically 1 GiB on x86_64, where
+MAX_ORDER caps the buddy allocator around 4 MiB) can't come directly
+from the buddy allocator, but the kernel will still try compaction +
+migration when you bump ``nr_hugepages``. For those rows the columns
+are computed at the pageblock order (the smallest hugepage size, 2
+MiB on x86_64) and divided by the ratio hp_size / pageblock_size:
+
+  Buddy safe  ≤N (M movable)    - N is the optimistic count assuming
+                                  contiguity: M free 2 MiB blocks in
+                                  Movable/Reclaimable/CMA pools,
+                                  divided by blocks-per-hugepage.
+                                  Needs /proc/pagetypeinfo (root).
+  Buddy max   ≤N (from M 2M free)
+                                - N is M / blocks-per-hugepage, M = all
+                                  free 2 MiB blocks at the pageblock
+                                  order (from /proc/buddyinfo, world-
+                                  readable). Consistent with the
+                                  smaller-size row: you can't get more
+                                  1 GiB pages than the 2 MiB count
+                                  divided by 512.
+
+Both are optimistic — the 2 MiB blocks aren't guaranteed to be
+contiguous at 1 GiB boundaries — but they're tighter and more honest
+than a MemFree-based ceiling. To add new 1 GiB pages reliably, prefer
+boot-time ``hugepagesz=1G hugepages=N`` on the kernel command line or
+a ``hugetlb_cma=`` reservation.
 
 Transparent Huge Pages (implicit THP, system-wide)
 --------------------------------------------------
@@ -1166,7 +1513,7 @@ Notes on attribution limits
 """
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     # Assume a 120-column terminal. argparse's default is the actual
     # terminal width via $COLUMNS; forcing 120 gives consistent,
     # readable help when piped or run in narrow panes.
@@ -1208,10 +1555,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     mem = parse_meminfo()
+    pools = collect_hugepages()
+    numa_hugetlb = collect_numa_hugepages()
     print_free(mem)
-    print_hugetlb(collect_hugepages())
+    print_hugetlb(pools)
     if args.numa:
-        print_numa(collect_numa_hugepages())
+        print_numa(numa_hugetlb)
+    print_hugepage_capacity(pools, numa_hugetlb)
     if not args.no_thp:
         print_thp(mem)
     if args.procs or args.shared or args.containers:

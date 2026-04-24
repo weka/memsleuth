@@ -13,7 +13,7 @@ A `free`-on-steroids for Linux: overall memory, a full breakdown of every config
 ## Requirements
 
 - Linux with `/proc` and `/sys/kernel/mm/hugepages`.
-- Python 3.9+ (uses `Path.readlink`, `from __future__ import annotations`).
+- Python 3.6+ (stdlib only; annotations use the `typing` module to work on older interpreters).
 - Per-process modes (`--procs`, `--shared`, `--containers`) require permission to read `/proc/<pid>/smaps` for the targets. Run as root or with `CAP_SYS_PTRACE` to attribute memory across all users.
 
 ## Install
@@ -410,6 +410,21 @@ Kernel Direct Map (physical memory mapped by page size)
   DirectMap4k:        9.26 GiB
   DirectMap2M:      116.38 GiB
   DirectMap1G:      388.00 GiB
+```
+
+### Hugepage allocation capacity (always shown)
+
+Right after the hugepage pool table memsleuth answers "could I allocate a hugepage right now, and from which NUMA node?" for every configured pool size.
+
+- **Pool free / Pool total** — reserved in the persistent hugepage pool (`/sys/.../hugepages-*kB/{free,nr}_hugepages` plus surplus). Immediately usable.
+- **Buddy safe** — free blocks at the hugepage order in Movable / Reclaimable / CMA migration pools, aggregated from `/proc/pagetypeinfo`. These can be allocated without relocating kernel data. The file is root-only; runs as a regular user render this cell as `needs root`.
+- **Buddy max** — free blocks across **all** migration types, from `/proc/buddyinfo` (world-readable). The pages beyond Buddy safe may need compaction/migration and aren't guaranteed.
+- **`pool only`** — the hugepage size exceeds `MAX_ORDER × base_page` (typically 1 GiB on x86_64, since MAX_ORDER caps the buddy allocator around 4 MiB). Those pages come only from the persistent pool or `hugetlb_cma=`; the buddy allocator can't produce new ones at runtime.
+
+Larger-order free blocks count for multiple hugepages — an order-K block splits into `2^(K - hp_order)` hugepages of the target size.
+
+```text
+<!-- paste: sudo ./memsleuth.py | sed -n '/HugeTLB Pages/,/Transparent/p'  -->
 ```
 
 ### 5. NUMA breakdown (`--numa`)

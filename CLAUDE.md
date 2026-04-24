@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Running
 
-`memsleuth` is a single-file Python 3 script, stdlib-only (no deps, no build, no tests yet).
+`memsleuth` is a single-file Python 3 script, stdlib-only (no deps, no build, no tests yet). It targets **Python 3.6+** so it runs on older server baselines; keep annotations using the `typing` module (`Dict`/`List`/`Optional`/`Tuple`/`Pattern`) rather than PEP 585/604 syntax (`dict[...]`, `X | None`), and don't add `from __future__ import annotations` (3.7+).
 
 ```bash
 ./memsleuth.py                  # free-style summary + hugetlb pools + THP + DirectMap
@@ -48,6 +48,18 @@ All logic lives in `memsleuth.py`. The flow is **collect → aggregate → print
 - When `keep_segments=True`, segments with `≥ SEGMENT_MIN_SHARED` shared bytes are kept, merged by `(path, perms)` so one file's `r-xp` / `r--p` / `rw-p` ranges show as separate logical rows.
 
 `~sharers` in the shared-segment output is approximated as `round(Rss / Pss)` per VMA. The kernel doesn't directly expose how many processes map a region; `Pss` gives us that for free.
+
+### Hugepage allocation capacity
+
+Always shown after the hugepage pool table. `print_hugepage_capacity` cross-references three sources per NUMA node, per configured hugepage size:
+
+1. **Persistent pool** (`numa_hugetlb` from `collect_numa_hugepages`) — `free` and `nr + surplus` per size per node.
+2. **Buddy allocator total** (`/proc/buddyinfo`, world-readable) — `hugepage_availability_all` sums order-N-or-higher free blocks across every zone. Larger-order blocks contribute multiple hugepages via the `2^(K-hp_order)` scaling.
+3. **Migration-type-aware count** (`/proc/pagetypeinfo`, root-only) — `hugepage_availability_safe` restricts to `Movable`/`Reclaimable`/`CMA` pools, which can be allocated without migrating kernel data. When unreadable, the column prints `needs root` and memsleuth falls back to buddyinfo for the "max" column.
+
+`base_page_size()` is `os.sysconf("SC_PAGE_SIZE")`, cached. The hugepage order is `log2(hp_size / base_page)`. Sizes where that order exceeds `buddy_max_order(buddy)` (usually 10 → 4 MiB on x86_64) — 1 GiB pages on typical kernels — fall back to a **pageblock-order** computation: `hugepage_availability_*` is called at the pageblock order (the smallest hugepage size, read from pagetypeinfo's `Pages per block: N` header; fallback to the smallest pool size), and the result is divided by `hp_size / pageblock_size`. This keeps the 1 GiB ceiling consistent with the 2 MiB row — you can't get more 1 GiB pages than the 2 MiB count / 512, a much tighter bound than MemFree.
+
+`parse_pagetypeinfo_blocks()` parses the file's second section ("Number of blocks type"), which counts pageblocks by migration type regardless of whether they're currently free. We currently use it only for its `pageblock_size` value (from the header); the block counts themselves could feed a migration-potential estimate in future work.
 
 ### Per-process NUMA attribution
 

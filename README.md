@@ -37,6 +37,7 @@ sudo ./memsleuth.py --procs       # needed to attribute memory for other users' 
 sudo ./memsleuth.py --unlink              # remove unused hugetlbfs files
 sudo ./memsleuth.py --release             # set nr_hugepages=0 for every size
 sudo ./memsleuth.py --unlink --release    # unlink first, then release; reclaims most
+./memsleuth.py --doctor                   # only fix recommendations; quiet when clean
 ./memsleuth.py --help             # flag reference
 ./memsleuth.py --help-fields      # detailed explanation of every column
 ```

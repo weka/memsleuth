@@ -12,7 +12,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Pattern, Tuple
+from typing import Any, Dict, List, Optional, Pattern, Tuple
 
 HUGEPAGES_ROOT = Path("/sys/kernel/mm/hugepages")
 NUMA_ROOT = Path("/sys/devices/system/node")
@@ -183,6 +183,139 @@ def hugetlbfs_holders(mounts: List[str]) -> Dict[Tuple[int, int], set]:
         except (OSError, PermissionError):
             pass
     return holders
+
+
+def lightweight_top_rss(top_n: int = 5) -> List[Tuple[int, int, str]]:
+    """Quick top-N RSS users via /proc/<pid>/status only — no smaps parse.
+
+    Returns a list of ``(rss_bytes, pid, command)`` sorted descending.
+    Status's ``VmRSS`` is the same total RSS smaps would compute, but
+    a single small file read per PID is dramatically cheaper than the
+    full per-VMA scan we use elsewhere.
+    """
+    rows: List[Tuple[int, int, str]] = []
+    for entry in PROC.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        rss = 0
+        try:
+            with open(entry / "status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            try:
+                                rss = int(parts[1]) * 1024
+                            except ValueError:
+                                rss = 0
+                        break
+        except (OSError, PermissionError):
+            continue
+        if rss <= 0:
+            continue
+        rows.append((rss, pid, read_process_name(str(pid))))
+    rows.sort(key=lambda r: -r[0])
+    return rows[:top_n]
+
+
+def run_doctor() -> int:
+    """Quick health check: report only actionable issues + recommendations.
+
+    Checks (each contributes at most one finding per affected resource):
+      1. Low available memory — MemAvailable < 10% of MemTotal. Includes
+         the top 5 RSS processes so the operator can immediately see
+         where to look.
+      2. Unused hugetlbfs files — files in any hugetlbfs mount with no
+         (dev, inode) holder. Recommends ``--unlink``. Root-only.
+      3. Idle hugepage pools — any pool with reserved pages where nothing
+         is in use (free == nr + surplus). Recommends ``--release`` or
+         lowering nr_hugepages.
+
+    Returns 0; the function never errors out on its own. Output is
+    suppressed for the rest of the report when this runs.
+    """
+    issues: List[Dict[str, Any]] = []
+    mem = parse_meminfo()
+    total = mem.get("MemTotal", 0)
+    available = mem.get("MemAvailable", 0)
+    ratio = available / total if total else 1.0
+    if total and ratio < 0.10:
+        lines = ["Top 5 RSS users:"]
+        for rss, pid, name in lightweight_top_rss(5):
+            lines.append("  PID {:<7} {:<44} RSS {:>11}".format(
+                pid, truncate(name, 44), human(rss)))
+        issues.append({
+            "title": "Low available memory: {} of {} ({:.1%})".format(
+                human(available), human(total), ratio),
+            "lines": lines,
+            "recommendation": "Investigate the processes above; restart services or kill leaks.",
+        })
+
+    mounts = hugetlbfs_mounts()
+    is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+    if mounts and is_root:
+        holders = hugetlbfs_holders(mounts)
+        per_size: Dict[int, List[int]] = {}  # psz -> [count, bytes]
+        seen_keys: set = set()
+        for mp in mounts:
+            try:
+                psz = os.statvfs(mp).f_frsize
+            except OSError:
+                psz = 0
+            try:
+                entries = list(Path(mp).iterdir())
+            except OSError:
+                continue
+            for entry in entries:
+                try:
+                    if not entry.is_file() or entry.is_symlink():
+                        continue
+                    st = entry.stat()
+                except OSError:
+                    continue
+                key = (st.st_dev, st.st_ino)
+                if key in seen_keys or key in holders:
+                    continue
+                seen_keys.add(key)
+                stats = per_size.setdefault(psz, [0, 0])
+                stats[0] += 1
+                stats[1] += st.st_size
+        for psz, (count, total_bytes) in sorted(per_size.items()):
+            issues.append({
+                "title": "Hugetlbfs has {} unused {} files ({})".format(
+                    count, human(psz) if psz else "unknown-size", human(total_bytes)),
+                "recommendation": "Run `sudo memsleuth.py --unlink` to remove them.",
+            })
+
+    for p in collect_hugepages():
+        if p["nr"] <= 0:
+            continue
+        used_pages = (p["nr"] + p["surplus"]) - p["free"]
+        if used_pages == 0 and p["free"] > 0:
+            issues.append({
+                "title": "HugeTLB pool has {} free {} pages ({}) with no in-use allocations".format(
+                    p["free"], human(p["size"]), human(p["free"] * p["size"])),
+                "recommendation": (
+                    "If not needed, run `sudo memsleuth.py --release` or write 0 to "
+                    "/sys/kernel/mm/hugepages/hugepages-{}kB/nr_hugepages."
+                ).format(p["size"] // 1024),
+            })
+
+    print("memsleuth doctor")
+    print()
+    if not issues:
+        print("No issues found.")
+        return 0
+    for i, issue in enumerate(issues):
+        if i > 0:
+            print()
+        print("- " + issue["title"])
+        for line in issue.get("lines") or []:
+            print("  " + line)
+        if "recommendation" in issue:
+            print("  Recommendation: " + issue["recommendation"])
+    return 0
 
 
 def print_hugetlbfs_summary() -> None:
@@ -1781,6 +1914,19 @@ Kernel Direct Map
   (module loads, eBPF JIT, permission changes) which costs TLB performance. The numbers describe
   *how* RAM is mapped into kernel virtual space — they aren't a separate consumer of RAM.
 
+Health check (--doctor)
+-----------------------
+Suppresses the normal report and prints only fix recommendations, one per actionable
+finding. If the system is clean it prints 'No issues found.' Checks performed:
+
+  Low available memory     MemAvailable < 10% of MemTotal. Includes the top 5 RSS
+                           processes (read from /proc/<pid>/status's VmRSS, fast).
+  Unused hugetlbfs files   Per page size, files in any hugetlbfs mount with no
+                           (dev, inode) holder. Recommends --unlink. Root-only.
+  Idle hugepage pool       Pools with reserved pages where nothing is in use
+                           (free == nr + surplus). Recommends --release or zeroing
+                           nr_hugepages.
+
 Destructive operations (--unlink, --release; require root)
 ----------------------------------------------------------
 --unlink   Walks every hugetlbfs mount listed in /proc/mounts and removes any top-level file
@@ -1847,6 +1993,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="with --unlink/--release: report what would be done without modifying "
                          "anything; useful for verifying the holder set on a new box before any "
                          "destructive action")
+    ap.add_argument("--doctor", action="store_true",
+                    help="run a quick health check and print only fix recommendations "
+                         "(low available memory, unused hugetlbfs files, idle hugepage pools); "
+                         "suppresses the normal report")
     ap.add_argument("--help-fields", action="store_true",
                     help="print a detailed explanation of every output field and exit")
     args = ap.parse_args(argv)
@@ -1858,6 +2008,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not MEMINFO.exists():
         print(f"error: {MEMINFO} not found — not a Linux system?", file=sys.stderr)
         return 1
+
+    if args.doctor:
+        return run_doctor()
 
     if args.unlink or args.release:
         if not args.dry_run and hasattr(os, "geteuid") and os.geteuid() != 0:

@@ -49,6 +49,10 @@ All logic lives in `memsleuth.py`. The flow is **collect → aggregate → print
 
 `~sharers` in the shared-segment output is approximated as `round(Rss / Pss)` per VMA. The kernel doesn't directly expose how many processes map a region; `Pss` gives us that for free.
 
+### Health check (`--doctor`)
+
+`run_doctor` short-circuits the normal report and prints one finding per actionable issue, plus a recommendation. Checks: `MemAvailable < 10%` of `MemTotal` (includes top-5 RSS via `lightweight_top_rss`, which reads `/proc/<pid>/status`'s `VmRSS` rather than parsing smaps — much faster); unused hugetlbfs files (root-only, dedup by `(dev, inode)`, reuses `hugetlbfs_holders`); idle hugepage pools (any size with `nr > 0` and `(nr + surplus) - free == 0`). Each finding has `title`, optional `lines`, optional `recommendation`. The function prints "No issues found." when nothing fired and always returns 0 — exit codes are not used to signal findings (operators pipe the output, scripts grep for "No issues found").
+
 ### Default hugetlbfs file summary
 
 `print_hugetlbfs_summary` is invoked unconditionally after the capacity table and prints a row **per hugepage size**. The page size for each mount comes from `os.statvfs(mp).f_frsize` (hugetlbfs reports its hugepage size as the filesystem block size). Files are deduplicated **within each size bucket** by `(st_dev, st_ino)` because bind-mounted hugetlbfs surfaces the same superblock at multiple paths. Holders are identified via the same `hugetlbfs_holders` dev+inode logic the destructive flags use, so the "unused" count exactly matches what `--unlink` would remove. Without root, the per-size output collapses to "N total (run as root to identify unused)". Early-exits when no hugetlbfs files exist anywhere.

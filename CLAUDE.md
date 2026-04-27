@@ -112,3 +112,11 @@ Summary gate (`has_containers`) triggers when classification produced more than 
 ### Invariant
 
 `FIELDS_HELP` (printed by `--help-fields`) documents every column in every table. When columns or semantics change, update `FIELDS_HELP` in the same edit — the epilog of `--help` points users at it.
+
+## Tests and helpers
+
+`tests/test_cli.py` is a stdlib-only `unittest` integration suite. Each test invokes `memsleuth.py` via `subprocess.run` and asserts on stable substrings — no mocks, no monkey-patching of `/proc`. Coverage spans every flag solo plus the combinations that matter (`--shared`/`--containers`/`--numa` with `--procs`, `--unlink` + `--release` ordering, `--no-thp`/`--no-directmap` suppression). Destructive flags are exercised via `--dry-run` and via the non-root rejection path; the rejection-path class is gated on `os.geteuid()`. Run with `python3 -m unittest tests.test_cli`.
+
+`memhog.py` at the repo root is a tiny stdlib helper that allocates and touches a fraction of `MemAvailable`, useful for exercising the `--doctor` low-memory alert end-to-end.
+
+When extending the CLI, prefer adding an integration test that asserts on a specific substring of the new output. Don't unit-test internals against synthetic `/proc` fixtures — the parsers are too entangled with the live data shape, and we've had bugs that only surfaced on real boxes.

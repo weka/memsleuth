@@ -630,6 +630,23 @@ See `./memsleuth.py --help-fields` for the canonical, always-in-sync documentati
 - `THP/code` vs `THP/data` split `AnonHugePages + FilePmdMapped` by whether the VMA is executable — i.e. whether transparent huge pages are actually backing your code or only data.
 - `HugeTLB` is `Private_Hugetlb + Shared_Hugetlb` — the explicit hugepage pool, separate from THP.
 
+## Tests
+
+A stdlib-only integration suite lives in `tests/`. Each test invokes `memsleuth.py` as a subprocess and asserts on stable substrings in the output, so the tests run on any Linux host without external dependencies and never modify state (destructive flags are exercised via `--dry-run` or via the non-root rejection path).
+
+```bash
+python3 -m unittest tests.test_cli            # full suite (~30 s)
+python3 -m unittest tests.test_cli.TestDoctor # one class
+./tests/test_cli.py -v                        # direct, verbose
+```
+
+`memhog.py` is a small helper at the repo root that allocates and touches a configurable fraction of `MemAvailable`, useful for triggering the `--doctor` low-memory alert:
+
+```bash
+python3 memhog.py 0.95   # 95% of available; ctrl-c to release
+./memsleuth.py --doctor  # in another shell while memhog holds memory
+```
+
 ## Caveats
 
 - Full `--procs` / `--shared` / `--containers` parse `/proc/<pid>/smaps` for every readable PID, which is noticeably slower than stat-only tools on busy systems. Count on single-digit seconds on a host with thousands of processes.

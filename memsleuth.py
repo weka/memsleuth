@@ -31,9 +31,6 @@ _BASE_PAGE_SIZE_CACHE: List[int] = []
 
 _ONLINE_NUMA_NODES_CACHE: List[List[int]] = []
 
-PROC_HP_FIELDS = ("AnonHugePages", "ShmemPmdMapped", "FilePmdMapped",
-                  "Shared_Hugetlb", "Private_Hugetlb")
-
 SMAPS_HEADER_RE = re.compile(
     r"^(?P<start>[0-9a-f]+)-[0-9a-f]+\s+(?P<perms>\S+)\s+\S+\s+\S+\s+\S+(?:\s+(?P<path>.*))?$"
 )
@@ -666,53 +663,26 @@ def parse_pagetypeinfo() -> Dict[int, Dict[str, Dict[str, List[int]]]]:
     return result
 
 
-def parse_pagetypeinfo_blocks() -> Tuple[Dict[int, Dict[str, Dict[str, int]]], int]:
-    """Parse /proc/pagetypeinfo's 'Number of blocks type' section.
+def parse_pageblock_size() -> int:
+    """Pageblock size in bytes, read from /proc/pagetypeinfo's
+    ``Pages per block: N`` header — typically 2 MiB on x86_64 with
+    4 KiB base pages. Returns 0 if the file is unreadable or the
+    header is missing.
 
-    Returns ``(blocks, pageblock_size)`` where ``blocks[node][zone][mtype]``
-    is the count of pageblocks of that migration type. The pageblock
-    size (in bytes) is derived from the file header's ``Pages per
-    block: N`` line — typically 2 MiB on x86_64 with 4 KiB base pages.
-
-    For hugepage sizes the buddy allocator can't express (1 GiB), this
-    section gives a tighter upper bound than MemFree alone: to allocate
-    an N GiB hugepage the kernel needs N GiB / pageblock_size
-    consecutive pageblocks that are all migratable. The count is still
-    optimistic (we don't know that they're actually contiguous), but
-    it's closer to what ``__alloc_contig_pages`` can actually deliver.
+    For hugepage sizes the buddy allocator can't express (1 GiB),
+    pageblock size gives a tighter upper bound than MemFree alone:
+    allocating an N-GiB hugepage needs N GiB / pageblock_size
+    consecutive pageblocks that are all migratable.
     """
     try:
         text = PAGETYPEINFO.read_text()
     except OSError:
-        return {}, 0
-    blocks: Dict[int, Dict[str, Dict[str, int]]] = {}
-    types: Optional[List[str]] = None
-    pages_per_block = 0
+        return 0
     for line in text.splitlines():
-        m_hdr = re.match(r"Pages per block:\s+(\d+)", line)
-        if m_hdr:
-            pages_per_block = int(m_hdr.group(1))
-            continue
-        if line.startswith("Number of blocks type"):
-            types = line.split()[4:]
-            continue
-        if types is None:
-            # still inside the free-area section; skip
-            continue
-        # Block-count rows don't have ", type X" after the zone.
-        m = re.match(r"Node\s+(\d+),\s+zone\s+(\S+)\s+(.+)$", line)
-        if not m or ", type" in line:
-            continue
-        counts = [_buddy_count(x) for x in m.group(3).split()[:len(types)]]
-        if len(counts) < len(types):
-            continue
-        node = int(m.group(1))
-        zone = m.group(2)
-        per_zone = blocks.setdefault(node, {}).setdefault(zone, {})
-        for t, c in zip(types, counts):
-            per_zone[t] = c
-    pageblock_size = pages_per_block * base_page_size() if pages_per_block else 0
-    return blocks, pageblock_size
+        m = re.match(r"Pages per block:\s+(\d+)", line)
+        if m:
+            return int(m.group(1)) * base_page_size()
+    return 0
 
 
 def hugepage_availability_all(
@@ -880,7 +850,7 @@ def print_hugepage_capacity(pools: List[dict],
         return
     buddy = parse_buddyinfo()
     pagetype = parse_pagetypeinfo()
-    _, pageblock_size = parse_pagetypeinfo_blocks()
+    pageblock_size = parse_pageblock_size()
     if not pageblock_size and pools:
         # Fallback: the smallest configured hugepage equals the pageblock
         # on kernels we care about (x86_64 with HUGETLB_PAGE_ORDER == 9).
@@ -1220,37 +1190,6 @@ CGROUP_PATTERNS: List[Tuple[Pattern[str], str]] = [
     (re.compile(r"/lxc(?:\.payload)?[./]([^/]+)"), "lxc"),
     (re.compile(r"machine-([^./]+)\.scope"), "nspawn"),
 ]
-
-_HOST_NS_CACHE: List[Optional[int]] = []
-
-
-def pid_namespace_inode(pid: str) -> Optional[int]:
-    """Return the nsfs inode of /proc/<pid>/ns/pid, or None if unreadable.
-
-    The symlink target format is ``pid:[4026531836]``; the bracketed
-    number is the namespace id (the nsfs inode).
-    """
-    try:
-        target = os.readlink(f"/proc/{pid}/ns/pid")
-    except OSError:
-        return None
-    try:
-        return int(target.rsplit("[", 1)[1].rstrip("]"))
-    except (ValueError, IndexError):
-        return None
-
-
-def host_pid_namespace() -> Optional[int]:
-    """The PID namespace inode of the memsleuth process itself.
-
-    Cached because it's invariant for the run. We use /proc/self because
-    /proc/1 is often unreadable for non-root users, but /proc/self is
-    always readable by us.
-    """
-    if not _HOST_NS_CACHE:
-        _HOST_NS_CACHE.append(pid_namespace_inode("self"))
-    return _HOST_NS_CACHE[0]
-
 
 def read_cgroup_info(pid: str) -> Tuple[List[str], Optional[str]]:
     """Parse /proc/<pid>/cgroup once. Return (all_paths, primary_path).

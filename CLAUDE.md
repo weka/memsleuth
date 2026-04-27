@@ -75,7 +75,7 @@ Always shown after the hugepage pool table. `print_hugepage_capacity` cross-refe
 
 `base_page_size()` is `os.sysconf("SC_PAGE_SIZE")`, cached. The hugepage order is `log2(hp_size / base_page)`. Sizes where that order exceeds `buddy_max_order(buddy)` (usually 10 → 4 MiB on x86_64) — 1 GiB pages on typical kernels — fall back to a **pageblock-order** computation: `hugepage_availability_*` is called at the pageblock order (the smallest hugepage size, read from pagetypeinfo's `Pages per block: N` header; fallback to the smallest pool size), and the result is divided by `hp_size / pageblock_size`. This keeps the 1 GiB ceiling consistent with the 2 MiB row — you can't get more 1 GiB pages than the 2 MiB count / 512, a much tighter bound than MemFree.
 
-`parse_pagetypeinfo_blocks()` parses the file's second section ("Number of blocks type"), which counts pageblocks by migration type regardless of whether they're currently free. We currently use it only for its `pageblock_size` value (from the header); the block counts themselves could feed a migration-potential estimate in future work.
+`parse_pageblock_size()` reads the `Pages per block: N` header from `/proc/pagetypeinfo` and returns the byte size of one pageblock. It's the only thing we need from that file beyond the migration-type free counts that `parse_pagetypeinfo` already provides.
 
 ### Per-process NUMA attribution
 
@@ -98,7 +98,7 @@ Always shown after the hugepage pool table. `print_hugepage_capacity` cross-refe
 4. `/user.slice/*` → one `user.slice` bucket (all user sessions grouped — we intentionally do not split by UID because the typical ask is "host vs. containers", not per-user rollups).
 5. Everything else (`/`, `/init.scope`, unreadable cgroup) → `system`.
 
-`pid_namespace_inode` and `host_pid_namespace` are present but deliberately not the primary signal: browser sandboxes each get their own PID namespace and treating every sandbox as a container drowns the real ones in noise. The helpers remain for a potential future flag that surfaces raw namespace splits.
+PID namespace inode is deliberately not used as a container signal: browser sandboxes each get their own PID namespace, and treating every sandbox as a container drowns the real ones in noise.
 
 Summary gate (`has_containers`) triggers when classification produced more than one bucket, or when `--containers` was explicitly requested. All per-container numbers are summed from our own smaps data — the tool never reads cgroup memory accounting, so numbers are consistent with the per-process view and don't depend on in-container instrumentation. Bucket ordering in the summary places real containers first (by RSS desc) and pushes `system.slice` / `user.slice` / `system` to the end in that fixed order, keeping the interesting rows at the top.
 

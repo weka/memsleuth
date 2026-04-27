@@ -185,6 +185,71 @@ def hugetlbfs_holders(mounts: List[str]) -> Dict[Tuple[int, int], set]:
     return holders
 
 
+def print_hugetlbfs_summary() -> None:
+    """Per-page-size count of hugetlbfs files, split into in-use vs unused.
+
+    The page size for each mount comes from ``os.statvfs(mp).f_frsize``
+    — hugetlbfs reports its hugepage size as the filesystem block size.
+    Files are deduplicated within each page-size bucket by (device,
+    inode) so bind-mounted hugetlbfs (same superblock at multiple
+    paths) doesn't double-count. Without root we can't identify
+    holders, so we drop to a count and say so. Skipped entirely when
+    no hugetlbfs files exist anywhere.
+    """
+    mounts = hugetlbfs_mounts()
+    if not mounts:
+        return
+    # Per-pagesize: page_size_bytes -> {(dev, ino): file_size}. Initialize
+    # an empty bucket for every mount's page size so sizes with zero files
+    # still surface (e.g. a configured 1 GiB hugetlbfs that's currently
+    # empty — operators want to see the size acknowledged).
+    seen_per_size: Dict[int, Dict[Tuple[int, int], int]] = {}
+    for mp in mounts:
+        try:
+            psz = os.statvfs(mp).f_frsize
+        except OSError:
+            psz = 0
+        bucket = seen_per_size.setdefault(psz, {})
+        try:
+            entries = list(Path(mp).iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if not entry.is_file() or entry.is_symlink():
+                    continue
+                st = entry.stat()
+            except OSError:
+                continue
+            key = (st.st_dev, st.st_ino)
+            if key not in bucket:
+                bucket[key] = st.st_size
+    if not seen_per_size:
+        return
+    is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+    holders = hugetlbfs_holders(mounts) if is_root else {}
+    print("Hugetlbfs files:")
+    for psz in sorted(seen_per_size.keys()):
+        bucket = seen_per_size[psz]
+        size_label = human(psz) if psz else "unknown size"
+        total = len(bucket)
+        if not is_root:
+            print("  {}: {} total (run as root to identify unused)".format(size_label, total))
+            continue
+        unused = 0
+        unused_bytes = 0
+        for key, size in bucket.items():
+            if key not in holders:
+                unused += 1
+                unused_bytes += size
+        used = total - unused
+        msg = "  {}: {} total, {} in use, {} unused".format(size_label, total, used, unused)
+        if unused:
+            msg += " ({} reclaimable; run --unlink to remove)".format(human(unused_bytes))
+        print(msg)
+    print()
+
+
 def unlink_unused_hugetlbfs(dry_run: bool = False) -> None:
     """Remove files in hugetlbfs mounts that no process has open or mapped.
 
@@ -1596,6 +1661,21 @@ than a MemFree-based ceiling. To add new 1 GiB pages reliably, prefer
 boot-time ``hugepagesz=1G hugepages=N`` on the kernel command line or
 a ``hugetlb_cma=`` reservation.
 
+Hugetlbfs file summary (always shown when any hugetlbfs file exists)
+--------------------------------------------------------------------
+After the capacity table, a per-page-size breakdown of hugetlbfs files:
+
+  Hugetlbfs files:
+    2.00 MiB: <total> total, <used> in use, <unused> unused [(<bytes> reclaimable; run --unlink to remove)]
+    1.00 GiB: ...
+
+The page size for each mount comes from os.statvfs(mountpoint).f_frsize (hugetlbfs reports its
+hugepage size as the filesystem block size). Files are deduplicated within each page-size bucket
+by (device, inode), since bind-mounted hugetlbfs surfaces the same superblock at multiple paths.
+Holder identification matches the same dev+inode rule that --unlink uses, so 'unused' here is
+exactly what --unlink would remove. As a non-root user holders can't be determined and the per-row
+output collapses to 'N total (run as root to identify unused)'.
+
 Transparent Huge Pages (implicit THP, system-wide)
 --------------------------------------------------
   AnonHugePages    /proc/meminfo — anon memory backed by THP.
@@ -1799,6 +1879,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.numa:
         print_numa(numa_hugetlb)
     print_hugepage_capacity(pools, numa_hugetlb)
+    print_hugetlbfs_summary()
     if not args.no_thp:
         print_thp(mem)
     if args.procs or args.shared or args.containers:

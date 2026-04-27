@@ -34,6 +34,9 @@ That's it — no pip, no build.
 ./memsleuth.py --numa             # split hugepage pools by NUMA node
 ./memsleuth.py --containers       # group the per-process listing by container
 sudo ./memsleuth.py --procs       # needed to attribute memory for other users' processes
+sudo ./memsleuth.py --unlink              # remove unused hugetlbfs files
+sudo ./memsleuth.py --release             # set nr_hugepages=0 for every size
+sudo ./memsleuth.py --unlink --release    # unlink first, then release; reclaims most
 ./memsleuth.py --help             # flag reference
 ./memsleuth.py --help-fields      # detailed explanation of every column
 ```

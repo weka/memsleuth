@@ -12,7 +12,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Pattern, Tuple, Union
+from typing import Dict, List, Optional, Pattern, Tuple
 
 HUGEPAGES_ROOT = Path("/sys/kernel/mm/hugepages")
 NUMA_ROOT = Path("/sys/devices/system/node")
@@ -92,6 +92,204 @@ def hugepage_size_from_dirname(name: str) -> Optional[int]:
     """`hugepages-2048kB` -> 2048 * 1024 bytes."""
     m = re.match(r"hugepages-(\d+)kB$", name)
     return int(m.group(1)) * 1024 if m else None
+
+
+def _unescape_proc(s: str) -> str:
+    """Decode the small escape set the kernel uses in /proc/mounts and
+    /proc/<pid>/maps for paths that contain spaces, tabs, newlines,
+    or backslashes."""
+    return (s.replace(r"\134", "\\")
+              .replace(r"\040", " ")
+              .replace(r"\011", "\t")
+              .replace(r"\012", "\n"))
+
+
+def hugetlbfs_mounts() -> List[str]:
+    """Mount points of fstype 'hugetlbfs' from /proc/mounts."""
+    try:
+        text = Path("/proc/mounts").read_text()
+    except OSError:
+        return []
+    result: List[str] = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[2] == "hugetlbfs":
+            result.append(_unescape_proc(parts[1]))
+    return result
+
+
+def hugetlbfs_holders(mounts: List[str]) -> Dict[Tuple[int, int], set]:
+    """Per-(device, inode) set of PIDs holding any hugetlbfs file.
+
+    Matching is done by the filesystem's device id (the hugetlbfs
+    superblock's dev_t) rather than by path. This is critical for
+    correctness across mount namespaces: a process inside an LXC
+    container or a Kubernetes pod has its own view of /proc/mounts and
+    its /proc/<pid>/maps shows paths from THAT namespace, which won't
+    match the host's mountpoints. The dev_t, however, is shared by
+    every process referencing the same superblock, so (device, inode)
+    is the safe key.
+
+    Both /proc/<pid>/maps (mappings) and /proc/<pid>/fd (open file
+    descriptors that may not be mmap'd) are scanned. Magic /proc/.../fd
+    symlinks resolve via stat to the underlying inode regardless of
+    namespace, which is also why the device-based approach works there.
+    """
+    holders: Dict[Tuple[int, int], set] = {}
+    if not mounts:
+        return holders
+
+    devs: set = set()
+    for mp in mounts:
+        try:
+            devs.add(Path(mp).stat().st_dev)
+        except OSError:
+            continue
+    if not devs:
+        return holders
+
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            with open(entry / "maps") as f:
+                for line in f:
+                    parts = line.split(maxsplit=5)
+                    if len(parts) < 5:
+                        continue
+                    maj_str, sep, min_str = parts[3].partition(":")
+                    if not sep:
+                        continue
+                    try:
+                        dev_id = os.makedev(int(maj_str, 16), int(min_str, 16))
+                        inode = int(parts[4])
+                    except ValueError:
+                        continue
+                    if dev_id not in devs or not inode:
+                        continue
+                    holders.setdefault((dev_id, inode), set()).add(pid)
+        except (OSError, PermissionError):
+            pass
+        try:
+            for fd in (entry / "fd").iterdir():
+                try:
+                    st = fd.stat()
+                except OSError:
+                    continue
+                if st.st_dev not in devs:
+                    continue
+                holders.setdefault((st.st_dev, st.st_ino), set()).add(pid)
+        except (OSError, PermissionError):
+            pass
+    return holders
+
+
+def unlink_unused_hugetlbfs(dry_run: bool = False) -> None:
+    """Remove files in hugetlbfs mounts that no process has open or mapped.
+
+    Holds back any file whose (device, inode) appears in /proc/<pid>/{maps,fd}
+    on the assumption that releasing it would silently keep the pages
+    pinned (the kernel keeps unlinked-but-mapped files alive). Reports
+    each file with its size and either the unlink result or the holding
+    PID list. With ``dry_run=True``, prints what *would* be unlinked
+    without touching anything.
+    """
+    label = "Unlink unused hugetlbfs files" + (" (dry run)" if dry_run else "")
+    print(label)
+    mounts = hugetlbfs_mounts()
+    if not mounts:
+        print("  (no hugetlbfs mounts found)")
+        print()
+        return
+    holders = hugetlbfs_holders(mounts)
+    for mp in mounts:
+        mp_path = Path(mp)
+        try:
+            entries = sorted(mp_path.iterdir())
+        except OSError as e:
+            print("  {}: cannot list ({})".format(mp, e))
+            continue
+        files = [e for e in entries if e.is_file() and not e.is_symlink()]
+        if not files:
+            print("  {}: (no files)".format(mp))
+            continue
+        print("  {}:".format(mp))
+        for entry in files:
+            try:
+                st = entry.stat()
+            except OSError as e:
+                print("    {}: cannot stat ({})".format(entry.name, e))
+                continue
+            label = "{} ({})".format(entry.name, human(st.st_size))
+            in_use = holders.get((st.st_dev, st.st_ino), set())
+            if in_use:
+                pid_list = sorted(in_use)
+                shown = ",".join(str(p) for p in pid_list[:5])
+                more = " +{} more".format(len(pid_list) - 5) if len(pid_list) > 5 else ""
+                print("    {}: in use by PID {}{} — skipped".format(label, shown, more))
+                continue
+            if dry_run:
+                print("    {}: WOULD unlink".format(label))
+                continue
+            try:
+                entry.unlink()
+                print("    {}: unlinked".format(label))
+            except OSError as e:
+                print("    {}: unlink failed ({})".format(label, e))
+    print()
+
+
+def release_hugepages(dry_run: bool = False) -> None:
+    """Set ``nr_hugepages = 0`` for every configured hugepage size.
+
+    The kernel won't release pages currently in use (mapped, in
+    hugetlbfs files, or otherwise pinned); the readback after the
+    write tells the truth, which we surface so the user can see
+    what's still holding pages. With ``dry_run=True``, only reports
+    the current ``nr_hugepages`` for each size without writing.
+    """
+    print("Release hugepages" + (" (dry run)" if dry_run else ""))
+    if not HUGEPAGES_ROOT.is_dir():
+        print("  (no /sys/kernel/mm/hugepages — kernel built without HUGETLB?)")
+        print()
+        return
+    sizes = sorted(HUGEPAGES_ROOT.iterdir(),
+                    key=lambda p: hugepage_size_from_dirname(p.name) or 0)
+    if not sizes:
+        print("  (no configured hugepage sizes)")
+        print()
+        return
+    for entry in sizes:
+        nr_path = entry / "nr_hugepages"
+        try:
+            before = int(nr_path.read_text().strip())
+        except (OSError, ValueError):
+            print("  {}: could not read nr_hugepages".format(entry.name))
+            continue
+        if before == 0:
+            print("  {}: already 0".format(entry.name))
+            continue
+        if dry_run:
+            print("  {}: WOULD set nr_hugepages {} -> 0".format(entry.name, before))
+            continue
+        try:
+            nr_path.write_text("0\n")
+        except OSError as e:
+            print("  {}: write failed ({})".format(entry.name, e))
+            continue
+        try:
+            after = int(nr_path.read_text().strip())
+        except (OSError, ValueError):
+            after = -1
+        if after == 0:
+            print("  {}: nr_hugepages {} -> 0".format(entry.name, before))
+        elif after < 0:
+            print("  {}: write succeeded but readback failed".format(entry.name))
+        else:
+            print("  {}: nr_hugepages {} -> {} ({} pages still in use, kernel could not release them)"
+                  .format(entry.name, before, after, after))
+    print()
 
 
 def collect_hugepages(root: Path = HUGEPAGES_ROOT) -> List[dict]:
@@ -1503,6 +1701,23 @@ Kernel Direct Map
   (module loads, eBPF JIT, permission changes) which costs TLB performance. The numbers describe
   *how* RAM is mapped into kernel virtual space — they aren't a separate consumer of RAM.
 
+Destructive operations (--unlink, --release; require root)
+----------------------------------------------------------
+--unlink   Walks every hugetlbfs mount listed in /proc/mounts and removes any top-level file
+           that no process is currently holding. "Holding" is determined by (device_id, inode)
+           matching against /proc/<pid>/maps and /proc/<pid>/fd, NOT by path: a process in a
+           different mount namespace (LXC/Kubernetes container) sees the file under a different
+           path that wouldn't match the host's /proc/mounts. The hugetlbfs superblock's device
+           id is shared across namespaces, so dev+inode reliably identifies the same file.
+           Files held by a process are skipped and their holding PIDs are reported. The kernel
+           keeps unlinked-but-mapped files alive, so removing held files would silently keep the
+           pages pinned — we deliberately leave them.
+--release  Writes 0 to /sys/kernel/mm/hugepages/hugepages-*kB/nr_hugepages for every configured
+           hugepage size. The kernel only releases pages that aren't currently in use; the
+           readback after the write tells the truth, and any non-zero residual is reported. Running
+           --unlink first frees pinned pages backing dead hugetlbfs files so the subsequent
+           --release reclaims more — when both flags are given they execute in that order.
+
 Notes on attribution limits
 ---------------------------
 - Per-process reporting parses /proc/<pid>/smaps and needs permission (root or CAP_SYS_PTRACE) to
@@ -1542,6 +1757,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="hide transparent hugepage counters")
     ap.add_argument("--no-directmap", action="store_true",
                     help="hide kernel DirectMap breakdown")
+    ap.add_argument("--unlink", action="store_true",
+                    help="remove files in hugetlbfs mounts that no process has open or mapped "
+                         "(requires root); runs before --release when both are given")
+    ap.add_argument("--release", action="store_true",
+                    help="set nr_hugepages=0 for every configured hugepage size, freeing the "
+                         "persistent pool back to the page allocator (requires root)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="with --unlink/--release: report what would be done without modifying "
+                         "anything; useful for verifying the holder set on a new box before any "
+                         "destructive action")
     ap.add_argument("--help-fields", action="store_true",
                     help="print a detailed explanation of every output field and exit")
     args = ap.parse_args(argv)
@@ -1553,6 +1778,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not MEMINFO.exists():
         print(f"error: {MEMINFO} not found — not a Linux system?", file=sys.stderr)
         return 1
+
+    if args.unlink or args.release:
+        if not args.dry_run and hasattr(os, "geteuid") and os.geteuid() != 0:
+            print("error: --unlink and --release require root (use --dry-run for a non-destructive preview)",
+                  file=sys.stderr)
+            return 1
+        # Unlink first so that any unreferenced hugetlbfs files release
+        # their hugepages before --release tries to drain the pool.
+        if args.unlink:
+            unlink_unused_hugetlbfs(dry_run=args.dry_run)
+        if args.release:
+            release_hugepages(dry_run=args.dry_run)
 
     mem = parse_meminfo()
     pools = collect_hugepages()

@@ -49,6 +49,14 @@ All logic lives in `memsleuth.py`. The flow is **collect → aggregate → print
 
 `~sharers` in the shared-segment output is approximated as `round(Rss / Pss)` per VMA. The kernel doesn't directly expose how many processes map a region; `Pss` gives us that for free.
 
+### Destructive flags: `--unlink`, `--release`
+
+Both require root and are guarded by an `os.geteuid()` check at the top of `main`. They run before any reporting so the report reflects the after-state.
+
+`unlink_unused_hugetlbfs` discovers hugetlbfs mountpoints from `/proc/mounts`, then `hugetlbfs_holders` builds a `{(device_id, inode): set(pid)}` map by scanning `/proc/<pid>/maps` and `/proc/<pid>/fd`. **Matching is by `(device, inode)`, not by path** — this matters because a process in a different mount namespace (LXC/Kubernetes container) shows the file under that namespace's path in its maps, which won't match the host's `/proc/mounts`. The hugetlbfs superblock's `dev_t` is shared across namespaces, so `(dev, inode)` reliably identifies a file from any process's view. The map paths and `(deleted)` suffix are no longer load-bearing; the dev id is computed via `os.makedev(int(major, 16), int(minor, 16))` from the maps line and via `fd.stat().st_dev` for the fd table. A previous path-based implementation silently unlinked files held by container processes — don't reintroduce path matching as the primary signal.
+
+`release_hugepages` writes `0\n` to `/sys/kernel/mm/hugepages/hugepages-*kB/nr_hugepages` for every configured size, then reads back to surface what the kernel actually freed (it can't release pages still in use). When both flags are given, `--unlink` runs first so dead hugetlbfs files release their backing pages before `--release` drains the pool. `_unescape_proc` handles the kernel's `\\040` / `\\134` / `\\011` / `\\012` escapes that appear in `/proc/mounts` and `/proc/<pid>/maps` paths.
+
 ### Hugepage allocation capacity
 
 Always shown after the hugepage pool table. `print_hugepage_capacity` cross-references three sources per NUMA node, per configured hugepage size:

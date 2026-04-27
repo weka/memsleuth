@@ -1164,11 +1164,6 @@ def compact_size(nbytes: int) -> str:
     return str(nbytes)
 
 
-def format_numa_rss(per_node: Dict[int, int], nodes: List[int]) -> str:
-    """``N0/N1/N2/...`` compact per-node RSS string."""
-    return "/".join(compact_size(per_node.get(n, 0)) for n in nodes)
-
-
 def read_process_name(pid: str) -> str:
     """Full command line with args, fall back to comm when cmdline is empty."""
     try:

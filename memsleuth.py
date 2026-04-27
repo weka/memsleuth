@@ -94,14 +94,21 @@ def hugepage_size_from_dirname(name: str) -> Optional[int]:
     return int(m.group(1)) * 1024 if m else None
 
 
+_PROC_ESCAPE_MAP = {
+    r"\040": " ",
+    r"\011": "\t",
+    r"\012": "\n",
+    r"\134": "\\",
+}
+_PROC_ESCAPE_RE = re.compile(r"\\(?:040|011|012|134)")
+
+
 def _unescape_proc(s: str) -> str:
     """Decode the small escape set the kernel uses in /proc/mounts and
     /proc/<pid>/maps for paths that contain spaces, tabs, newlines,
-    or backslashes."""
-    return (s.replace(r"\134", "\\")
-              .replace(r"\040", " ")
-              .replace(r"\011", "\t")
-              .replace(r"\012", "\n"))
+    or backslashes. Single-pass so a literal `\\040` encoded as `\\134040`
+    decodes to `\\040`, not a space."""
+    return _PROC_ESCAPE_RE.sub(lambda m: _PROC_ESCAPE_MAP[m.group(0)], s)
 
 
 def hugetlbfs_mounts() -> List[str]:

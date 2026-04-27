@@ -100,7 +100,7 @@ _PROC_ESCAPE_MAP = {
     r"\012": "\n",
     r"\134": "\\",
 }
-_PROC_ESCAPE_RE = re.compile(r"\\(?:040|011|012|134)")
+_PROC_ESCAPE_RE = re.compile("|".join(re.escape(k) for k in _PROC_ESCAPE_MAP))
 
 
 def _unescape_proc(s: str) -> str:
@@ -108,6 +108,8 @@ def _unescape_proc(s: str) -> str:
     /proc/<pid>/maps for paths that contain spaces, tabs, newlines,
     or backslashes. Single-pass so a literal `\\040` encoded as `\\134040`
     decodes to `\\040`, not a space."""
+    if "\\" not in s:
+        return s
     return _PROC_ESCAPE_RE.sub(lambda m: _PROC_ESCAPE_MAP[m.group(0)], s)
 
 

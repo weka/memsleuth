@@ -185,6 +185,30 @@ def hugetlbfs_holders(mounts: List[str]) -> Dict[Tuple[int, int], set]:
     return holders
 
 
+def parse_size_arg(s: str) -> int:
+    """Parse a human size like '10G', '512M', '1024' into bytes.
+
+    Suffixes (case-insensitive): K, M, G, T using powers of 1024. No
+    suffix = bytes. Used for the --low-mem-max CLI option so users can
+    write '10G' instead of 10737418240.
+    """
+    s = s.strip()
+    if not s:
+        raise argparse.ArgumentTypeError("size must not be empty")
+    suffixes = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
+    last = s[-1].upper()
+    try:
+        if last in suffixes:
+            value = float(s[:-1]) * suffixes[last]
+        else:
+            value = float(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError("invalid size: {!r}".format(s))
+    if value < 0:
+        raise argparse.ArgumentTypeError("size must not be negative: {!r}".format(s))
+    return int(value)
+
+
 def lightweight_top_rss(top_n: int = 5) -> List[Tuple[int, int, str]]:
     """Quick top-N RSS users via /proc/<pid>/status only — no smaps parse.
 
@@ -219,18 +243,25 @@ def lightweight_top_rss(top_n: int = 5) -> List[Tuple[int, int, str]]:
     return rows[:top_n]
 
 
-def run_doctor() -> int:
+DEFAULT_LOW_MEM_PCT = 5.0
+DEFAULT_LOW_MEM_MAX = 10 * (1 << 30)  # 10 GiB
+
+
+def run_doctor(low_mem_pct: float = DEFAULT_LOW_MEM_PCT,
+                low_mem_max: int = DEFAULT_LOW_MEM_MAX) -> int:
     """Quick health check: report only actionable issues + recommendations.
 
     Checks (each contributes at most one finding per affected resource):
-      1. Low available memory — MemAvailable < 10% of MemTotal. Includes
-         the top 5 RSS processes so the operator can immediately see
-         where to look.
+      1. Low available memory — MemAvailable below
+         ``min(low_mem_pct% of MemTotal, low_mem_max)``. The cap matters
+         on big machines: 5% of 1 TiB is 50 GiB, which is still plenty;
+         a 10 GiB absolute floor stops the alert from firing for
+         normal headroom levels. Includes the top 5 RSS processes so
+         the operator can immediately see where to look.
       2. Unused hugetlbfs files — files in any hugetlbfs mount with no
          (dev, inode) holder. Recommends ``--unlink``. Root-only.
-      3. Idle hugepage pools — any pool with reserved pages where nothing
-         is in use (free == nr + surplus). Recommends ``--release`` or
-         lowering nr_hugepages.
+      3. Idle hugepage pools — any pool with releasable pages
+         (free - resv > 0). Recommends ``--release``.
 
     Returns 0; the function never errors out on its own. Output is
     suppressed for the rest of the report when this runs.
@@ -240,14 +271,15 @@ def run_doctor() -> int:
     total = mem.get("MemTotal", 0)
     available = mem.get("MemAvailable", 0)
     ratio = available / total if total else 1.0
-    if total and ratio < 0.10:
+    threshold = int(min(low_mem_pct / 100.0 * total, low_mem_max)) if total else 0
+    if total and threshold > 0 and available < threshold:
         lines = ["Top 5 RSS users:"]
         for rss, pid, name in lightweight_top_rss(5):
             lines.append("  PID {:<7} {:<44} RSS {:>11}".format(
                 pid, truncate(name, 44), human(rss)))
         issues.append({
-            "title": "Low available memory: {} of {} ({:.1%})".format(
-                human(available), human(total), ratio),
+            "title": "Low available memory: {} of {} ({:.1%}; threshold {})".format(
+                human(available), human(total), ratio, human(threshold)),
             "lines": lines,
             "recommendation": "Investigate the processes above; restart services or kill leaks.",
         })
@@ -289,18 +321,32 @@ def run_doctor() -> int:
             })
 
     for p in collect_hugepages():
-        if p["nr"] <= 0:
+        # Releasable = free pages minus reservations; reserved pages
+        # are committed for future faults and shouldn't be returned.
+        releasable = max(0, p["free"] - p["resv"])
+        if releasable <= 0:
             continue
+        releasable_bytes = releasable * p["size"]
         used_pages = (p["nr"] + p["surplus"]) - p["free"]
-        if used_pages == 0 and p["free"] > 0:
-            issues.append({
-                "title": "HugeTLB pool has {} free {} pages ({}) with no in-use allocations".format(
-                    p["free"], human(p["size"]), human(p["free"] * p["size"])),
-                "recommendation": (
-                    "If not needed, run `sudo memsleuth.py --release` or write 0 to "
-                    "/sys/kernel/mm/hugepages/hugepages-{}kB/nr_hugepages."
-                ).format(p["size"] // 1024),
-            })
+        if used_pages == 0 and p["resv"] == 0:
+            title = ("HugeTLB pool of {} pages is entirely idle ({} reserved, none in use)"
+                     .format(human(p["size"]), human(releasable_bytes)))
+        else:
+            extras = []
+            if used_pages:
+                extras.append("{} in use".format(used_pages))
+            if p["resv"]:
+                extras.append("{} reserved".format(p["resv"]))
+            tail = " alongside " + ", ".join(extras) if extras else ""
+            title = ("HugeTLB pool has {} releasable {} pages ({} unused){}"
+                     .format(releasable, human(p["size"]), human(releasable_bytes), tail))
+        issues.append({
+            "title": title,
+            "recommendation": (
+                "Run `sudo memsleuth.py --release` to right-size the pool to its in-use + "
+                "reserved page count, returning the {} unused pages to the page allocator."
+            ).format(releasable),
+        })
 
     print("memsleuth doctor")
     print()
@@ -439,13 +485,18 @@ def unlink_unused_hugetlbfs(dry_run: bool = False) -> None:
 
 
 def release_hugepages(dry_run: bool = False) -> None:
-    """Set ``nr_hugepages = 0`` for every configured hugepage size.
+    """Right-size every configured hugepage pool to what's actually committed.
 
-    The kernel won't release pages currently in use (mapped, in
-    hugetlbfs files, or otherwise pinned); the readback after the
-    write tells the truth, which we surface so the user can see
-    what's still holding pages. With ``dry_run=True``, only reports
-    the current ``nr_hugepages`` for each size without writing.
+    Computes ``target = nr_hugepages - (free_hugepages - resv_hugepages)``
+    per size and writes that. The released count equals the truly
+    free portion (free pages minus reserved-but-unfaulted ones); the
+    pool ends up matching the in-use plus reserved page count, so
+    no surplus pages are created and no future page-fault on a
+    reservation will fail.
+
+    Skips with a status line when nothing is releasable (free <= resv)
+    or the pool is already at zero. With ``dry_run=True``, only
+    reports the target without writing.
     """
     print("Release hugepages" + (" (dry run)" if dry_run else ""))
     if not HUGEPAGES_ROOT.is_dir():
@@ -460,19 +511,31 @@ def release_hugepages(dry_run: bool = False) -> None:
         return
     for entry in sizes:
         nr_path = entry / "nr_hugepages"
+        free_path = entry / "free_hugepages"
+        resv_path = entry / "resv_hugepages"
         try:
             before = int(nr_path.read_text().strip())
+            free = int(free_path.read_text().strip())
+            resv = int(resv_path.read_text().strip()) if resv_path.exists() else 0
         except (OSError, ValueError):
-            print("  {}: could not read nr_hugepages".format(entry.name))
+            print("  {}: could not read pool counters".format(entry.name))
             continue
         if before == 0:
             print("  {}: already 0".format(entry.name))
             continue
+        releasable = max(0, free - resv)
+        if releasable == 0:
+            in_use = before - free
+            print("  {}: nothing free to release ({} in use, {} reserved)"
+                  .format(entry.name, in_use, resv))
+            continue
+        target = before - releasable
         if dry_run:
-            print("  {}: WOULD set nr_hugepages {} -> 0".format(entry.name, before))
+            print("  {}: WOULD set nr_hugepages {} -> {} (release {} free pages)"
+                  .format(entry.name, before, target, releasable))
             continue
         try:
-            nr_path.write_text("0\n")
+            nr_path.write_text("{}\n".format(target))
         except OSError as e:
             print("  {}: write failed ({})".format(entry.name, e))
             continue
@@ -480,13 +543,18 @@ def release_hugepages(dry_run: bool = False) -> None:
             after = int(nr_path.read_text().strip())
         except (OSError, ValueError):
             after = -1
-        if after == 0:
-            print("  {}: nr_hugepages {} -> 0".format(entry.name, before))
+        if after == target:
+            print("  {}: nr_hugepages {} -> {} (released {} free pages)"
+                  .format(entry.name, before, after, before - after))
         elif after < 0:
             print("  {}: write succeeded but readback failed".format(entry.name))
+        elif after > target:
+            # Race: more pages became allocated between our read and write,
+            # so the kernel kept them in the pool to honor the new commitments.
+            print("  {}: nr_hugepages {} -> {} (released {} pages; {} kept due to concurrent allocation)"
+                  .format(entry.name, before, after, before - after, after - target))
         else:
-            print("  {}: nr_hugepages {} -> {} ({} pages still in use, kernel could not release them)"
-                  .format(entry.name, before, after, after))
+            print("  {}: nr_hugepages {} -> {}".format(entry.name, before, after))
     print()
 
 
@@ -1919,13 +1987,16 @@ Health check (--doctor)
 Suppresses the normal report and prints only fix recommendations, one per actionable
 finding. If the system is clean it prints 'No issues found.' Checks performed:
 
-  Low available memory     MemAvailable < 10% of MemTotal. Includes the top 5 RSS
-                           processes (read from /proc/<pid>/status's VmRSS, fast).
+  Low available memory     MemAvailable below min(--low-mem-pct% of MemTotal,
+                           --low-mem-max). Defaults: 5% capped at 10 GiB so a
+                           1 TiB host doesn't false-alarm on 30 GiB headroom.
+                           Includes the top 5 RSS processes (read from
+                           /proc/<pid>/status's VmRSS, fast).
   Unused hugetlbfs files   Per page size, files in any hugetlbfs mount with no
                            (dev, inode) holder. Recommends --unlink. Root-only.
-  Idle hugepage pool       Pools with reserved pages where nothing is in use
-                           (free == nr + surplus). Recommends --release or zeroing
-                           nr_hugepages.
+  Idle hugepage pool       Any pool with releasable pages (free - resv > 0).
+                           Always recommends --release, which right-sizes the
+                           pool to in-use + reserved without creating surplus.
 
 Destructive operations (--unlink, --release; require root)
 ----------------------------------------------------------
@@ -1938,11 +2009,14 @@ Destructive operations (--unlink, --release; require root)
            Files held by a process are skipped and their holding PIDs are reported. The kernel
            keeps unlinked-but-mapped files alive, so removing held files would silently keep the
            pages pinned — we deliberately leave them.
---release  Writes 0 to /sys/kernel/mm/hugepages/hugepages-*kB/nr_hugepages for every configured
-           hugepage size. The kernel only releases pages that aren't currently in use; the
-           readback after the write tells the truth, and any non-zero residual is reported. Running
-           --unlink first frees pinned pages backing dead hugetlbfs files so the subsequent
-           --release reclaims more — when both flags are given they execute in that order.
+--release  Right-sizes every configured hugepage pool to what's actually committed by writing
+           ``target = nr_hugepages - (free_hugepages - resv_hugepages)`` to nr_hugepages. This
+           releases only the truly free portion (free pages that aren't reservations earmarked
+           for future faults), so no surplus pages are created and no future-faulted reservation
+           breaks. If free <= resv (nothing safely releasable) the pool is left alone with a
+           status line. Running --unlink first frees pages backing dead hugetlbfs files so the
+           subsequent --release reclaims more — when both flags are given they execute in that
+           order.
 
 Notes on attribution limits
 ---------------------------
@@ -1997,6 +2071,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="run a quick health check and print only fix recommendations "
                          "(low available memory, unused hugetlbfs files, idle hugepage pools); "
                          "suppresses the normal report")
+    ap.add_argument("--low-mem-pct", type=float, default=DEFAULT_LOW_MEM_PCT, metavar="PCT",
+                    help="--doctor low-memory threshold as percent of MemTotal "
+                         "(default: {:g})".format(DEFAULT_LOW_MEM_PCT))
+    ap.add_argument("--low-mem-max", type=parse_size_arg, default=DEFAULT_LOW_MEM_MAX,
+                    metavar="BYTES",
+                    help="--doctor low-memory threshold cap, e.g. '10G', '512M', '1024' "
+                         "(default: 10G). Effective threshold is min(pct%%, max).")
     ap.add_argument("--help-fields", action="store_true",
                     help="print a detailed explanation of every output field and exit")
     args = ap.parse_args(argv)
@@ -2010,7 +2091,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     if args.doctor:
-        return run_doctor()
+        return run_doctor(low_mem_pct=args.low_mem_pct,
+                            low_mem_max=args.low_mem_max)
 
     if args.unlink or args.release:
         if not args.dry_run and hasattr(os, "geteuid") and os.geteuid() != 0:

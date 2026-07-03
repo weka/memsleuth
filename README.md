@@ -3,7 +3,11 @@
 A `free`-on-steroids for Linux: overall memory, a full breakdown of every configured hugepage size, per-process memory attribution (RSS / code / heap / stack / anon), swap usage split by destination, shared-segment attribution with sharer counts, and container-level rollups. Single Python 3 file, stdlib only, no install step.
 
 > [!IMPORTANT]
-> **⬇️ [Download the latest `memsleuth.py`](https://github.com/weka/memsleuth/releases/latest/download/memsleuth.py)** — a single file, always the newest build. Check your version with `memsleuth --version`; see [Install](#install) for a curl one-liner.
+> **⬇️ Get the latest `memsleuth.py`** — one file, no install. Copy, paste, run:
+> ```bash
+> curl -fLo memsleuth.py https://github.com/weka/memsleuth/releases/latest/download/memsleuth.py && chmod +x memsleuth.py
+> ```
+> Then `./memsleuth.py` (or `./memsleuth.py --version`).
 
 `memsleuth` was built to answer questions the usual tools can't:
 

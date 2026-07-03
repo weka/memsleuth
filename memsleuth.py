@@ -253,6 +253,56 @@ DEFAULT_LOW_MEM_PCT = 5.0
 DEFAULT_LOW_MEM_MAX = 10 * (1 << 30)  # 10 GiB
 
 
+def _hugepage_doctor_finding(p: dict) -> Optional[dict]:
+    """Doctor finding for one hugepage pool (from collect_hugepages), or None.
+
+    Fires on either of two states, both addressed by --release:
+      - unreserved free pages (``free - resv``) that can be returned now;
+      - surplus pages, which sit above the persistent pool and usually mean
+        someone shrank nr_hugepages while pages were still in use.
+    --release can free only the unreserved free pages (the kernel floors the
+    shrink at reserved + in-use); it absorbs surplus back into the persistent
+    pool to normalize the count. Returns {"title", "recommendation"} or None.
+    """
+    releasable = max(0, p["free"] - p["resv"])
+    surplus = p["surplus"]
+    if releasable <= 0 and surplus <= 0:
+        return None
+    hp = human(p["size"])
+    # `nr` already includes surplus; don't add it again.
+    used_pages = p["nr"] - p["free"]
+    extras = []
+    if used_pages:
+        extras.append("{} in use".format(used_pages))
+    if p["resv"]:
+        extras.append("{} reserved".format(p["resv"]))
+    ctx = " ({})".format(", ".join(extras)) if extras else ""
+
+    if surplus and releasable:
+        title = ("HugeTLB {} pool has {} surplus pages ({}) and {} releasable free pages ({}){}"
+                 .format(hp, surplus, human(surplus * p["size"]),
+                         releasable, human(releasable * p["size"]), ctx))
+        rec = ("Run `sudo memsleuth.py --release` to absorb the {} surplus pages into the "
+               "persistent pool and return the {} free pages to the allocator."
+               .format(surplus, releasable))
+    elif surplus:
+        title = ("HugeTLB {} pool has {} surplus pages ({}){}"
+                 .format(hp, surplus, human(surplus * p["size"]), ctx))
+        rec = ("Surplus pages sit above the persistent pool and usually appear after "
+               "shrinking nr_hugepages while pages were in use. Run `sudo memsleuth.py "
+               "--release` to absorb them back into the persistent pool (normalizes the "
+               "count; the in-use pages are not freed until their processes exit).")
+    else:  # releasable free pages only
+        title = ("HugeTLB {} pool has {} free pages ({}){}"
+                 .format(hp, releasable, human(releasable * p["size"]), ctx))
+        rec = ("Run `sudo memsleuth.py --release` to drop the {} free pages from the pool, "
+               "returning them to the page allocator.").format(releasable)
+    if p["resv"] and releasable:
+        rec += (" The {} reserved page(s) are kept — the kernel won't shrink "
+                "below reserved + in-use.").format(p["resv"])
+    return {"title": title, "recommendation": rec}
+
+
 def run_doctor(low_mem_pct: float = DEFAULT_LOW_MEM_PCT,
                 low_mem_max: int = DEFAULT_LOW_MEM_MAX) -> int:
     """Quick health check: report only actionable issues + recommendations.
@@ -266,9 +316,12 @@ def run_doctor(low_mem_pct: float = DEFAULT_LOW_MEM_PCT,
          the operator can immediately see where to look.
       2. Unused hugetlbfs files — files in any hugetlbfs mount with no
          (dev, inode) holder. Recommends ``--unlink``. Root-only.
-      3. Idle hugepage pools — any pool with free pages. Recommends
-         ``--release``, which drops every free page (including
-         reserved-but-unfaulted ones).
+      3. Idle hugepage pools — any pool with unreserved free pages
+         (free > resv). Recommends ``--release`` (reserved pages are kept).
+      4. Surplus hugepages — any pool with surplus > 0, which usually
+         means someone shrank nr_hugepages while pages were in use.
+         Recommends ``--release``, which absorbs surplus back into the
+         persistent pool.
 
     Returns 0; the function never errors out on its own. Output is
     suppressed for the rest of the report when this runs.
@@ -328,30 +381,9 @@ def run_doctor(low_mem_pct: float = DEFAULT_LOW_MEM_PCT,
             })
 
     for p in collect_hugepages():
-        # --release drops every free page, reservations included.
-        releasable = p["free"]
-        if releasable <= 0:
-            continue
-        releasable_bytes = releasable * p["size"]
-        used_pages = (p["nr"] + p["surplus"]) - p["free"]
-        extras = []
-        if used_pages:
-            extras.append("{} in use".format(used_pages))
-        if p["resv"]:
-            extras.append("{} reserved".format(p["resv"]))
-        tail = " alongside " + ", ".join(extras) if extras else ""
-        title = ("HugeTLB pool has {} free {} pages ({}){}"
-                 .format(releasable, human(p["size"]), human(releasable_bytes), tail))
-        rec = ("Run `sudo memsleuth.py --release` to drop the {} free pages from the pool, "
-               "returning them to the page allocator.").format(releasable)
-        if p["resv"]:
-            rec += (" Note: this also drops the {} reserved page(s); processes that "
-                    "had reserved but not yet faulted them in will fail their next "
-                    "page-fault on that mapping.").format(p["resv"])
-        issues.append({
-            "title": title,
-            "recommendation": rec,
-        })
+        finding = _hugepage_doctor_finding(p)
+        if finding:
+            issues.append(finding)
 
     print("memsleuth doctor")
     print()
@@ -489,16 +521,45 @@ def unlink_unused_hugetlbfs(dry_run: bool = False) -> None:
     print()
 
 
+def _release_target(nr: int, free: int, resv: int) -> int:
+    """nr_hugepages target for --release: keep reserved + in-use, drop the rest.
+
+    ``nr`` is the total pool count as read from sysfs — it already includes any
+    surplus pages (``h->nr_huge_pages``). In-use = ``nr - free``. The kernel
+    floors any shrink at ``resv + nr - free`` (reserved + in-use) and never goes
+    below it, so that floor is exactly what we aim for. Reserved pages therefore
+    cannot be released; ``free - resv`` is the releasable count.
+    """
+    releasable = max(0, free - resv)
+    return nr - releasable
+
+
 def release_hugepages(dry_run: bool = False) -> None:
-    """Shrink every configured hugepage pool to its in-use page count.
+    """Shrink every configured hugepage pool to its reserved + in-use pages.
 
-    Writes ``target = nr_hugepages - free_hugepages`` per size, which drops
-    every free page from the pool — including reserved-but-unfaulted pages.
-    Any process that had reserved hugepages but hadn't yet faulted them in
-    will fail its next page-fault on that mapping.
+    ``nr_hugepages`` reads back as the *total* pool (persistent + surplus). A
+    write to it, however, is interpreted as the *persistent*-pool target, where
+    ``persistent = nr - surplus``. Two consequences drive this function:
 
-    Skips with a status line when no pages are free or the pool is already
-    at zero. With ``dry_run=True``, only reports the target without writing.
+    * **Surplus.** Surplus pages sit above the persistent pool and usually
+      appear after someone shrinks nr_hugepages while pages are still in use
+      (the kernel converts the balance to surplus rather than freeing it). We
+      *absorb* surplus whenever it is present by writing the current total —
+      this promotes surplus back to persistent without allocating, normalizing
+      a pool that was shrunk below its in-use count — then re-read and shrink.
+      This also fixes the case where a plain ``nr - free`` write is
+      ``>= persistent`` (so the kernel would merely reshuffle surplus and free
+      nothing). Side effect: surviving in-use surplus pages become *persistent*,
+      so when their processes later exit those pages linger as free-persistent
+      (a later --release reclaims them) instead of auto-returning to the system.
+    * **Reserved.** The kernel floors the shrink at ``resv + nr - free``, so
+      reserved-but-unfaulted pages are kept — they cannot be dropped through
+      nr_hugepages. We target that floor (via ``_release_target``) so readback
+      matches the target instead of falsely reporting "kept N in use".
+
+    Absorbs surplus even when no page is freeable (normalization only). Skips
+    with a status line when the pool is at zero, or has neither surplus nor a
+    releasable free page. With ``dry_run=True``, only reports intended writes.
     """
     print("Release hugepages" + (" (dry run)" if dry_run else ""))
     if not HUGEPAGES_ROOT.is_dir():
@@ -514,23 +575,72 @@ def release_hugepages(dry_run: bool = False) -> None:
     for entry in sizes:
         nr_path = entry / "nr_hugepages"
         free_path = entry / "free_hugepages"
+        surplus_path = entry / "surplus_hugepages"
+        resv_path = entry / "resv_hugepages"
         try:
             before = int(nr_path.read_text().strip())
             free = int(free_path.read_text().strip())
+            surplus = int(surplus_path.read_text().strip()) if surplus_path.exists() else 0
+            resv = int(resv_path.read_text().strip()) if resv_path.exists() else 0
         except (OSError, ValueError):
             print("  {}: could not read pool counters".format(entry.name))
             continue
         if before == 0:
             print("  {}: already 0".format(entry.name))
             continue
-        if free == 0:
-            print("  {}: nothing free to release ({} in use)".format(entry.name, before))
-            continue
-        target = before - free
+
         if dry_run:
-            print("  {}: WOULD set nr_hugepages {} -> {} (release {} free pages)"
-                  .format(entry.name, before, target, free))
+            releasable = max(0, free - resv)
+            target = _release_target(before, free, resv)
+            if surplus and releasable:
+                print("  {}: WOULD absorb {} surplus (write nr_hugepages={}), then set "
+                      "nr_hugepages -> {} (release {} free pages)"
+                      .format(entry.name, surplus, before, target, releasable))
+            elif surplus:
+                print("  {}: WOULD absorb {} surplus (write nr_hugepages={}); "
+                      "no free pages to release".format(entry.name, surplus, before))
+            elif releasable:
+                print("  {}: WOULD set nr_hugepages {} -> {} (release {} free pages)"
+                      .format(entry.name, before, target, releasable))
+            else:
+                in_use = before - free
+                if resv:
+                    print("  {}: nothing releasable ({} in use, {} reserved — "
+                          "reserved pages can't be dropped)".format(entry.name, in_use, resv))
+                else:
+                    print("  {}: nothing free to release ({} in use)".format(entry.name, in_use))
             continue
+
+        # Absorb surplus into the persistent pool first (see docstring), whenever
+        # present — this alone normalizes a pool shrunk below its in-use count.
+        # Absorbing leaves the total unchanged but zeroes surplus.
+        absorbed = 0
+        if surplus:
+            try:
+                nr_path.write_text("{}\n".format(before))
+                before = int(nr_path.read_text().strip())
+                free = int(free_path.read_text().strip())
+                resv = int(resv_path.read_text().strip()) if resv_path.exists() else 0
+                absorbed = surplus
+            except (OSError, ValueError) as e:
+                print("  {}: failed to absorb surplus ({})".format(entry.name, e))
+                continue
+        prefix = "absorbed {} surplus; ".format(absorbed) if absorbed else ""
+
+        releasable = max(0, free - resv)
+        if releasable == 0:
+            in_use = before - free
+            if absorbed:
+                print("  {}: {}no free pages to release ({} in use)"
+                      .format(entry.name, prefix, in_use))
+            elif resv:
+                print("  {}: nothing releasable ({} in use, {} reserved — "
+                      "reserved pages can't be dropped)".format(entry.name, in_use, resv))
+            else:
+                print("  {}: nothing free to release ({} in use)".format(entry.name, in_use))
+            continue
+
+        target = _release_target(before, free, resv)
         try:
             nr_path.write_text("{}\n".format(target))
         except OSError as e:
@@ -541,15 +651,15 @@ def release_hugepages(dry_run: bool = False) -> None:
         except (OSError, ValueError):
             after = -1
         if after == target:
-            print("  {}: nr_hugepages {} -> {} (released {} free pages)"
-                  .format(entry.name, before, after, before - after))
+            print("  {}: {}nr_hugepages {} -> {} (released {} free pages)"
+                  .format(entry.name, prefix, before, after, before - after))
         elif after < 0:
-            print("  {}: write succeeded but readback failed".format(entry.name))
+            print("  {}: {}write succeeded but readback failed".format(entry.name, prefix))
         elif after > target:
-            print("  {}: nr_hugepages {} -> {} (released {} pages; kernel kept {} still in use)"
-                  .format(entry.name, before, after, before - after, after - target))
+            print("  {}: {}nr_hugepages {} -> {} (released {} pages; kernel kept {} still in use)"
+                  .format(entry.name, prefix, before, after, before - after, after - target))
         else:
-            print("  {}: nr_hugepages {} -> {}".format(entry.name, before, after))
+            print("  {}: {}nr_hugepages {} -> {}".format(entry.name, prefix, before, after))
     print()
 
 
@@ -793,8 +903,9 @@ def print_hugetlb(pools: List[dict]) -> None:
     used_bytes = 0
     free_bytes = 0
     for p in pools:
-        # `nr_hugepages` is the persistent pool; surplus pages are on top.
-        total_pages = p["nr"] + p["surplus"]
+        # `nr_hugepages` already counts surplus pages (h->nr_huge_pages), so it
+        # IS the total pool — adding surplus again would double-count.
+        total_pages = p["nr"]
         used_pages = total_pages - p["free"]
         total_bytes += total_pages * p["size"]
         used_bytes += used_pages * p["size"]
@@ -821,7 +932,8 @@ def print_hugepage_capacity(pools: List[dict],
     """Per-NUMA "can I allocate a hugepage right now?" table.
 
     Columns:
-      Pool free/total - persistent pool (from /sys/.../hugepages-*kB/).
+      Pool free/total - hugepage pool from /sys/.../hugepages-*kB/
+                        (nr_hugepages already includes surplus).
       Buddy safe      - free pages in Movable/Reclaimable/CMA pools at
                         order ≥ hp_order, allocatable without
                         compacting kernel data. Requires
@@ -860,7 +972,7 @@ def print_hugepage_capacity(pools: List[dict],
             pool_by_size[(p["size"], node_id)] = p
 
     print("Hugepage allocation capacity")
-    print("  (pool = persistent hugepage pool; buddy = free blocks big enough in the page allocator)")
+    print("  (pool = hugepage pool from sysfs, nr incl. surplus; buddy = free blocks big enough in the page allocator)")
     hdr = ("Size", "Node", "Pool free", "Pool total", "Buddy safe", "Buddy max")
     widths = (10, 8, 11, 11, 22, 22)
     print("  " + "  ".join(f"{h:<{w}}" if i < 2 else f"{h:>{w}}"
@@ -885,7 +997,8 @@ def print_hugepage_capacity(pools: List[dict],
         for node in nodes_present:
             pnode = pool_by_size.get((hp_size, node))
             pool_free = str(pnode["free"]) if pnode else "—"
-            pool_total = str(pnode["nr"] + pnode["surplus"]) if pnode else "—"
+            # per-node nr_hugepages already includes surplus; don't double-count.
+            pool_total = str(pnode["nr"]) if pnode else "—"
             if not can_buddy:
                 # The buddy allocator can't produce this size directly,
                 # but the kernel still attempts compaction + migration
@@ -941,7 +1054,8 @@ def print_numa(nodes: Dict[int, List[dict]]) -> None:
             continue
         print("    " + "".join(f"{c:>{w}}" for c, w in zip(cols, widths)))
         for p in pools:
-            total_pages = p["nr"] + p["surplus"]
+            # nr_hugepages already includes surplus; don't add it again.
+            total_pages = p["nr"]
             used_pages = total_pages - p["free"]
             row = (
                 human(p["size"]),
@@ -1735,14 +1849,15 @@ Top summary (free(1) style)
 HugeTLB Pages (explicit hugepage pool, per size)
 ------------------------------------------------
   Size        Hugepage size for this row (2 MiB, 1 GiB, ...).
-  Total       /sys/.../nr_hugepages — the persistent pool.
+  Total       /sys/.../nr_hugepages — the whole pool. This ALREADY includes surplus pages
+              (it is the kernel's h->nr_huge_pages), so persistent = Total - Surplus.
   Free        /sys/.../free_hugepages — pool pages not currently in use.
   Rsvd        /sys/.../resv_hugepages — reserved for mappings that faulted a VMA but haven't yet
               touched the page.
   Surplus     /sys/.../surplus_hugepages — pages allocated on demand above the persistent pool
-              (returned to the system once no longer used).
+              (returned to the system once no longer used). Counted within Total, not on top of it.
   Overcmt     /sys/.../nr_overcommit_hugepages — the cap on Surplus.
-  Used        (Total + Surplus) - Free.
+  Used        Total - Free (pages currently faulted in).
   Mem Used    Used * Size, in bytes.
   Mem Free    Free * Size, in bytes.
 
@@ -1751,7 +1866,7 @@ Hugepage allocation capacity (always shown when any pool size is configured)
 Per-NUMA answer to "could I allocate a hugepage right now, and how many?"
 
   Pool free / Pool total  /sys/kernel/mm/hugepages-*kB/{free,nr}_hugepages per node
-                          (plus surplus). Already reserved, immediately usable.
+                          (nr already includes surplus). Already reserved, immediately usable.
   Buddy safe              Free blocks of order ≥ the hugepage order, in
                           Movable / Reclaimable / CMA migration pools. These
                           are allocatable without migrating in-use kernel
@@ -1926,9 +2041,13 @@ finding. If the system is clean it prints 'No issues found.' Checks performed:
                            /proc/<pid>/status's VmRSS, fast).
   Unused hugetlbfs files   Per page size, files in any hugetlbfs mount with no
                            (dev, inode) holder. Recommends --unlink. Root-only.
-  Idle hugepage pool       Any pool with free > 0. Recommends --release,
-                           which drops every free page (including reserved-
-                           but-unfaulted) by writing nr_hugepages - free.
+  Idle hugepage pool       Any pool with unreserved free pages (free > resv).
+                           Recommends --release, which returns those pages to
+                           the allocator (reserved pages are kept).
+  Surplus hugepages        Any pool with surplus > 0 — usually the aftermath of
+                           shrinking nr_hugepages while pages were in use.
+                           Recommends --release, which absorbs surplus back into
+                           the persistent pool (in-use pages stay put).
 
 Destructive operations (--unlink, --release; require root)
 ----------------------------------------------------------
@@ -1941,13 +2060,16 @@ Destructive operations (--unlink, --release; require root)
            Files held by a process are skipped and their holding PIDs are reported. The kernel
            keeps unlinked-but-mapped files alive, so removing held files would silently keep the
            pages pinned — we deliberately leave them.
---release  Shrinks every configured hugepage pool to its in-use page count by writing
-           ``target = nr_hugepages - free_hugepages`` to nr_hugepages. This drops every free
-           page, including reserved-but-unfaulted ones: any process that had reserved hugepages
-           via mmap but hadn't yet faulted them in will fail its next page-fault on that
-           mapping. If no pages are free the pool is left alone with a status line. Running
-           --unlink first frees pages backing dead hugetlbfs files so the subsequent --release
-           reclaims more — when both flags are given they execute in that order.
+--release  Shrinks every configured hugepage pool to its reserved + in-use pages, returning the
+           unreserved free pages to the allocator. nr_hugepages reads back as the total pool
+           (it already includes surplus); a write to it sets the *persistent* pool target
+           (persistent = nr - surplus). So when surplus pages exist, --release first absorbs them
+           by writing the current total (promotes surplus to persistent, no allocation), then
+           writes ``target = nr - (free - resv)``. Reserved pages CANNOT be dropped: the kernel
+           floors any shrink at reserved + in-use. If nothing is releasable the pool is left alone
+           with a status line. Running --unlink first frees pages backing dead hugetlbfs files so
+           the subsequent --release reclaims more — when both flags are given they execute in
+           that order.
 
 Notes on attribution limits
 ---------------------------
@@ -1992,16 +2114,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="remove files in hugetlbfs mounts that no process has open or mapped "
                          "(requires root); runs before --release when both are given")
     ap.add_argument("--release", action="store_true",
-                    help="set nr_hugepages=0 for every configured hugepage size, freeing the "
-                         "persistent pool back to the page allocator (requires root)")
+                    help="shrink every hugepage pool to its reserved + in-use pages, returning "
+                         "the unreserved free pages to the allocator; absorbs surplus first "
+                         "(requires root)")
     ap.add_argument("--dry-run", action="store_true",
                     help="with --unlink/--release: report what would be done without modifying "
                          "anything; useful for verifying the holder set on a new box before any "
                          "destructive action")
     ap.add_argument("--doctor", action="store_true",
                     help="run a quick health check and print only fix recommendations "
-                         "(low available memory, unused hugetlbfs files, idle hugepage pools); "
-                         "suppresses the normal report")
+                         "(low available memory, unused hugetlbfs files, idle hugepage pools, "
+                         "surplus hugepages); suppresses the normal report")
     ap.add_argument("--low-mem-pct", type=float, default=DEFAULT_LOW_MEM_PCT, metavar="PCT",
                     help="--doctor low-memory threshold as percent of MemTotal "
                          "(default: {:g})".format(DEFAULT_LOW_MEM_PCT))

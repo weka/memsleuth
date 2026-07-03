@@ -14,6 +14,7 @@ on any host. Tests that exercise root-only behaviour are gated on
 ``os.geteuid()``.
 """
 
+import importlib.util
 import os
 import subprocess
 import sys
@@ -22,6 +23,18 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "memsleuth.py"
+
+
+def _load_memsleuth():
+    """Import memsleuth.py as a module for unit-testing pure helpers."""
+    spec = importlib.util.spec_from_file_location("memsleuth", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+memsleuth = _load_memsleuth()
 
 
 def run(*args, expect_rc=0, timeout=60):
@@ -164,6 +177,76 @@ class TestDestructiveRequiresRoot(unittest.TestCase):
     def test_release_unlink_requires_root(self):
         _, err, _ = run("--release", "--unlink", expect_rc=1)
         self.assertIn("require root", err)
+
+
+class TestReleaseTarget(unittest.TestCase):
+    """Pure arithmetic behind --release. `nr` reads back as the total pool
+    (already includes surplus); the target keeps reserved + in-use pages."""
+
+    def test_no_reservations(self):
+        # nr=100 total, 30 free, none reserved -> keep 70 in use.
+        self.assertEqual(memsleuth._release_target(100, 30, 0), 70)
+
+    def test_reserved_pages_are_kept(self):
+        # 30 free of which 5 reserved -> release 25, keep 75 (70 in use + 5 rsvd).
+        self.assertEqual(memsleuth._release_target(100, 30, 5), 75)
+
+    def test_surplus_included_in_nr(self):
+        # nr already includes surplus, so once surplus is absorbed the total is
+        # still nr. nr=150 total, 30 free, 0 reserved -> keep 120.
+        self.assertEqual(memsleuth._release_target(150, 30, 0), 120)
+
+    def test_all_free_reserved_releases_nothing(self):
+        self.assertEqual(memsleuth._release_target(100, 5, 5), 100)
+
+    def test_nothing_free(self):
+        self.assertEqual(memsleuth._release_target(100, 0, 0), 100)
+
+
+class TestHugepageDoctorFinding(unittest.TestCase):
+    """Doctor finding logic per pool. `nr` includes surplus; the check fires on
+    releasable free pages (free - resv) OR surplus > 0, both fixed by --release."""
+
+    @staticmethod
+    def pool(nr, free, resv=0, surplus=0, size=2 * 1024 * 1024):
+        return {"size": size, "nr": nr, "free": free, "resv": resv,
+                "surplus": surplus, "overcommit": 0}
+
+    def test_healthy_pool_no_finding(self):
+        # all pages in use, none free, no surplus -> nothing to report.
+        self.assertIsNone(memsleuth._hugepage_doctor_finding(self.pool(10, 0)))
+
+    def test_empty_pool_no_finding(self):
+        self.assertIsNone(memsleuth._hugepage_doctor_finding(self.pool(0, 0)))
+
+    def test_all_free_reserved_no_finding(self):
+        # free pages exist but all reserved, no surplus -> nothing releasable.
+        self.assertIsNone(memsleuth._hugepage_doctor_finding(self.pool(10, 5, resv=5)))
+
+    def test_free_pages_only(self):
+        f = memsleuth._hugepage_doctor_finding(self.pool(10, 4))
+        self.assertIsNotNone(f)
+        self.assertIn("4 free pages", f["title"])
+        self.assertNotIn("surplus", f["title"])
+
+    def test_surplus_only_fires(self):
+        # the 'echo 0 > nr_hugepages while in use' aftermath: all surplus, in use.
+        f = memsleuth._hugepage_doctor_finding(self.pool(10, 0, surplus=10))
+        self.assertIsNotNone(f)
+        self.assertIn("10 surplus pages", f["title"])
+        self.assertIn("absorb", f["recommendation"])
+
+    def test_composite_surplus_and_free(self):
+        # NUMA composite: free on one node, surplus in use on another.
+        f = memsleuth._hugepage_doctor_finding(self.pool(28, 8, surplus=20))
+        self.assertIsNotNone(f)
+        self.assertIn("20 surplus pages", f["title"])
+        self.assertIn("8 releasable free pages", f["title"])
+        self.assertIn("20 in use", f["title"])  # nr - free, not double-counted
+
+    def test_reserved_note_when_freeing(self):
+        f = memsleuth._hugepage_doctor_finding(self.pool(10, 8, resv=3))
+        self.assertIn("reserved page(s) are kept", f["recommendation"])
 
 
 if __name__ == "__main__":

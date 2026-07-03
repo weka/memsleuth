@@ -74,6 +74,14 @@ Both require root and are guarded by an `os.geteuid()` check at the top of `main
 
 Do not add surplus to `nr` anywhere when computing totals/used — `nr` already contains it; doing so double-counts (this was a latent display bug in `print_hugetlb`/`print_numa`/`print_hugepage_capacity`/the doctor that only surfaced when surplus > 0). If readback shows the pool larger than `target`, the kernel couldn't shrink that far (pages faulted in between our read and the write). When both flags are given, `--unlink` runs first so dead hugetlbfs files release their backing pages before `--release` drains the pool. `_unescape_proc` handles the kernel's `\\040` / `\\134` / `\\011` / `\\012` escapes that appear in `/proc/mounts` and `/proc/<pid>/maps` paths.
 
+### Destructive flags: `--defrag`, `--grow`
+
+These help *get more hugepages allocated* (the inverse of `--release`), and are guarded by the same root check. When several destructive flags are combined they run `unlink → release → defrag → grow` so each maximizes the next.
+
+`run_defrag` does the manual "make room for hugepages" playbook globally: `os.sync()`, `echo 3 > /proc/sys/vm/drop_caches` (evicts clean page cache), `echo 1 > /proc/sys/vm/compact_memory`. It prints allocatable-hugepage totals before/after via `_allocatable_totals` (buddy-safe = Movable/Reclaimable/CMA, buddy-max = all migration types, summed across nodes). Global only — deliberately no per-node variant. Sizes the buddy allocator can't represent (1 GiB: order > `MAX_ORDER`) map to `None`/"pool-only" because compaction can't assemble them, so a delta would mislead.
+
+`grow_hugepages` allocates on a specific node from `SIZE:NODE:COUNT` specs (`_parse_grow_spec` validates size ∈ {2M,1G} configured on the host, node ∈ `online_numa_nodes()`, count ≥ 0). **`COUNT` is an absolute per-node target, never a delta and never shrinks** — a pool already ≥ COUNT is left alone (printed as "already N ... no change"). It writes the **per-node** `nr_hugepages` (`/sys/devices/system/node/<n>/hugepages/hugepages-*kB/nr_hugepages`); if the kernel can't reach the target in one write it compacts *that node* (`/sys/devices/system/node/<n>/compact`, per-node — more effective than global for a targeted alloc, and not a user-facing per-numa flag) and retries up to 3 times, treating a failed compact as non-fatal. Per-node only by design (the user explicitly did not want a global-alloc option that could be confused with per-node). A runtime 1 GiB grow usually falls short without `hugetlb_cma`/boot-time reservation — that's expected and reported as a shortfall, not an error.
+
 ### Hugepage allocation capacity
 
 Always shown after the hugepage pool table. `print_hugepage_capacity` cross-references three sources per NUMA node, per configured hugepage size:

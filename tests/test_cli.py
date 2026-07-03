@@ -162,6 +162,27 @@ class TestDestructiveDryRun(unittest.TestCase):
         self.assertLess(out.index("Unlink unused hugetlbfs"),
                          out.index("Release hugepages"))
 
+    def test_defrag_dry_run(self):
+        out, _, _ = run("--defrag", "--dry-run")
+        self.assertIn("Defrag memory", out)
+        self.assertIn("WOULD", out)
+
+    def test_grow_dry_run(self):
+        out, _, _ = run("--grow", "2M:0:8", "--dry-run")
+        self.assertIn("Grow hugepages", out)
+
+    def test_grow_bad_spec_is_reported_not_crash(self):
+        out, _, rc = run("--grow", "nonsense", "--dry-run")
+        self.assertIn("Grow hugepages", out)
+        self.assertEqual(rc, 0)
+
+    def test_destructive_order(self):
+        out, _, _ = run("--unlink", "--release", "--defrag", "--grow", "2M:0:1", "--dry-run")
+        # unlink -> release -> defrag -> grow
+        order = [out.index(s) for s in ("Unlink unused hugetlbfs", "Release hugepages",
+                                        "Defrag memory", "Grow hugepages")]
+        self.assertEqual(order, sorted(order))
+
 
 @unittest.skipIf(os.geteuid() == 0,
                   "destructive flags only behave non-trivially as non-root")
@@ -178,6 +199,14 @@ class TestDestructiveRequiresRoot(unittest.TestCase):
         _, err, _ = run("--release", "--unlink", expect_rc=1)
         self.assertIn("require root", err)
 
+    def test_defrag_requires_root(self):
+        _, err, _ = run("--defrag", expect_rc=1)
+        self.assertIn("require root", err)
+
+    def test_grow_requires_root(self):
+        _, err, _ = run("--grow", "2M:0:1", expect_rc=1)
+        self.assertIn("require root", err)
+
 
 class TestVersion(unittest.TestCase):
     def test_version_long(self):
@@ -187,6 +216,44 @@ class TestVersion(unittest.TestCase):
     def test_version_short(self):
         out, _, _ = run("-V")
         self.assertIn("memsleuth", out)
+
+
+class TestParseGrowSpec(unittest.TestCase):
+    SIZES = {2 * 1024 * 1024: "hugepages-2048kB", 1024 * 1024 * 1024: "hugepages-1048576kB"}
+    NODES = [0, 1]
+
+    def p(self, spec):
+        return memsleuth._parse_grow_spec(spec, self.SIZES, self.NODES)
+
+    def test_valid_2m(self):
+        self.assertEqual(self.p("2M:0:512"), (2 * 1024 * 1024, 0, 512))
+
+    def test_valid_1g_lowercase(self):
+        self.assertEqual(self.p("1g:1:8"), (1024 * 1024 * 1024, 1, 8))
+
+    def test_bad_arity(self):
+        with self.assertRaises(ValueError):
+            self.p("2M:0")
+
+    def test_unknown_size(self):
+        with self.assertRaises(ValueError):
+            self.p("4M:0:1")
+
+    def test_size_not_configured(self):
+        with self.assertRaises(ValueError):
+            memsleuth._parse_grow_spec("1G:0:1", {2 * 1024 * 1024: "hugepages-2048kB"}, [0])
+
+    def test_node_not_online(self):
+        with self.assertRaises(ValueError):
+            self.p("2M:5:1")
+
+    def test_bad_count(self):
+        with self.assertRaises(ValueError):
+            self.p("2M:0:x")
+
+    def test_negative_count(self):
+        with self.assertRaises(ValueError):
+            self.p("2M:0:-3")
 
 
 class TestReleaseTarget(unittest.TestCase):

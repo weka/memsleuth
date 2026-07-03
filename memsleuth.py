@@ -11,6 +11,7 @@ import argparse
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Pattern, Tuple
 
@@ -665,6 +666,194 @@ def release_hugepages(dry_run: bool = False) -> None:
                   .format(entry.name, prefix, before, after, before - after, after - target))
         else:
             print("  {}: {}nr_hugepages {} -> {}".format(entry.name, prefix, before, after))
+    print()
+
+
+DROP_CACHES = Path("/proc/sys/vm/drop_caches")
+COMPACT_MEMORY = Path("/proc/sys/vm/compact_memory")
+
+
+def _allocatable_totals(pools: List[dict]) -> Dict[int, Optional[dict]]:
+    """Total hugepages the buddy allocator could hand out right now, per size,
+    summed across NUMA nodes: ``{size: {"safe": int|None, "max": int}}``.
+
+    ``safe`` counts only Movable/Reclaimable/CMA blocks (no kernel-data
+    migration; None when /proc/pagetypeinfo needs root). ``max`` counts all
+    migration types. Sizes the buddy allocator can't represent directly
+    (typically 1 GiB) map to ``None`` — compaction can't assemble them, so a
+    before/after delta would be misleading. Used for the --defrag report.
+    """
+    buddy = parse_buddyinfo()
+    pagetype = parse_pagetypeinfo()
+    base = base_page_size()
+    max_order = buddy_max_order(buddy) if buddy else -1
+    out: Dict[int, Optional[dict]] = {}
+    for p in pools:
+        ratio = p["size"] // base if base else 0
+        is_pow2 = ratio > 0 and (ratio & (ratio - 1)) == 0
+        hp_order = ratio.bit_length() - 1 if is_pow2 else -1
+        if not (0 <= hp_order <= max_order):
+            out[p["size"]] = None
+            continue
+        total_max = sum(v["all"] for v in hugepage_availability_all(buddy, hp_order).values())
+        total_safe = (sum(hugepage_availability_safe(pagetype, hp_order).values())
+                      if pagetype else None)
+        out[p["size"]] = {"safe": total_safe, "max": total_max}
+    return out
+
+
+def run_defrag(dry_run: bool = False) -> None:
+    """Reclaim page cache and compact memory so higher-order (hugepage)
+    allocations are more likely to succeed: ``sync`` + drop_caches + a global
+    ``compact_memory``. Prints an allocatable-hugepage before/after so you can
+    see whether it actually gained you contiguity. Root-only.
+    """
+    print("Defrag memory" + (" (dry run)" if dry_run else ""))
+    print("  (sync + drop_caches — evicts page cache, a perf hit — then a global compaction pass)")
+    if dry_run:
+        print("  WOULD sync")
+        print("  WOULD drop_caches (echo 3 > {})".format(DROP_CACHES))
+        print("  WOULD compact_memory (echo 1 > {})".format(COMPACT_MEMORY))
+        print()
+        return
+
+    pools = collect_hugepages()
+    before = _allocatable_totals(pools) if pools else {}
+
+    try:
+        os.sync()
+        print("  sync ... done")
+    except OSError as e:
+        print("  sync ... failed ({})".format(e))
+    for label, path in (("drop_caches", DROP_CACHES), ("compact_memory", COMPACT_MEMORY)):
+        try:
+            path.write_text("{}\n".format(3 if path is DROP_CACHES else 1))
+            print("  {} ... done".format(label))
+        except OSError as e:
+            print("  {} ... failed ({})".format(label, e))
+
+    if pools:
+        time.sleep(0.5)  # let compaction settle before re-reading buddyinfo
+        after = _allocatable_totals(collect_hugepages())
+        print("  allocatable hugepages (buddy), before -> after:")
+        for p in pools:
+            hp = human(p["size"])
+            b, a = before.get(p["size"]), after.get(p["size"])
+            if b is None or a is None:
+                print("    {}: pool-only (buddy can't assemble this size; compaction won't help)".format(hp))
+                continue
+            safe = ("{} -> {}".format(b["safe"], a["safe"])
+                    if b["safe"] is not None else "needs root")
+            print("    {}: safe {}   max {} -> {}".format(hp, safe, b["max"], a["max"]))
+    print()
+
+
+def _parse_grow_spec(spec: str, valid_sizes: Dict[int, str],
+                     online_nodes: List[int]) -> Tuple[int, int, int]:
+    """Parse a --grow ``SIZE:NODE:COUNT`` spec, e.g. ``1G:0:8`` or ``2M:1:512``.
+
+    Returns ``(size_bytes, node, count)``. Raises ValueError with a
+    human-readable message on any malformed / out-of-range field.
+    ``valid_sizes`` maps configured hugepage size in bytes -> sysfs dir name;
+    ``online_nodes`` is the set of valid node ids.
+    """
+    parts = spec.split(":")
+    if len(parts) != 3:
+        raise ValueError("expected SIZE:NODE:COUNT (e.g. 1G:0:8), got {!r}".format(spec))
+    size_str, node_str, count_str = (p.strip() for p in parts)
+    sizes = {"2M": 2 * 1024 * 1024, "2MB": 2 * 1024 * 1024,
+             "1G": 1024 * 1024 * 1024, "1GB": 1024 * 1024 * 1024}
+    size = sizes.get(size_str.upper())
+    if size is None:
+        raise ValueError("size must be 2M or 1G, got {!r}".format(size_str))
+    if size not in valid_sizes:
+        raise ValueError("no {} hugepage pool configured on this host".format(size_str))
+    try:
+        node = int(node_str)
+    except ValueError:
+        raise ValueError("node must be an integer, got {!r}".format(node_str))
+    if node not in online_nodes:
+        raise ValueError("node {} is not online (online nodes: {})"
+                         .format(node, ",".join(map(str, online_nodes))))
+    try:
+        count = int(count_str)
+    except ValueError:
+        raise ValueError("count must be an integer, got {!r}".format(count_str))
+    if count < 0:
+        raise ValueError("count must be >= 0, got {}".format(count))
+    return size, node, count
+
+
+def grow_hugepages(specs: List[str], dry_run: bool = False) -> None:
+    """Allocate hugepages on a specific NUMA node, per ``SIZE:NODE:COUNT`` spec.
+
+    COUNT is an absolute per-node target: the node's pool is grown *to* COUNT
+    (never shrunk — a pool already at/above COUNT is left alone). Each grow
+    writes the per-node nr_hugepages and, if the kernel can't reach the target
+    in one shot, compacts that node and retries a few times. Prints
+    ``current -> achieved (target)`` and flags any shortfall. Root-only.
+    """
+    print("Grow hugepages" + (" (dry run)" if dry_run else ""))
+    valid_sizes = {}
+    if HUGEPAGES_ROOT.is_dir():
+        for entry in HUGEPAGES_ROOT.iterdir():
+            size = hugepage_size_from_dirname(entry.name)
+            if size is not None:
+                valid_sizes[size] = entry.name
+    online = online_numa_nodes()
+    for spec in specs:
+        try:
+            size, node, count = _parse_grow_spec(spec, valid_sizes, online)
+        except ValueError as e:
+            print("  {}: {}".format(spec, e))
+            continue
+        hp = human(size)
+        node_dir = NUMA_ROOT / "node{}".format(node) / "hugepages" / valid_sizes[size]
+        nr_path = node_dir / "nr_hugepages"
+        if not nr_path.exists():
+            print("  node{} {}: per-node pool not present ({})".format(node, hp, nr_path))
+            continue
+        try:
+            cur = int(nr_path.read_text().strip())
+        except (OSError, ValueError):
+            print("  node{} {}: could not read {}".format(node, hp, nr_path))
+            continue
+        if cur >= count:
+            print("  node{} {}: already {} (>= target {}), no change".format(node, hp, cur, count))
+            continue
+        if dry_run:
+            print("  node{} {}: WOULD grow {} -> {}".format(node, hp, cur, count))
+            continue
+        # Write the target; if the kernel can't gather enough contiguous memory
+        # in one shot, compact this node and retry a couple more times.
+        node_compact = NUMA_ROOT / "node{}".format(node) / "compact"
+        achieved = cur
+        for attempt in range(3):
+            try:
+                nr_path.write_text("{}\n".format(count))
+            except OSError as e:
+                print("  node{} {}: write failed ({})".format(node, hp, e))
+                break
+            try:
+                achieved = int(nr_path.read_text().strip())
+            except (OSError, ValueError):
+                achieved = -1
+                break
+            if achieved >= count:
+                break
+            if attempt < 2:  # nudge with per-node compaction, then retry
+                try:
+                    node_compact.write_text("1\n")
+                except OSError:
+                    pass  # compaction sysfs may be absent; retry the write anyway
+                time.sleep(0.5)
+        if achieved < 0:
+            print("  node{} {}: write succeeded but readback failed".format(node, hp))
+        elif achieved >= count:
+            print("  node{} {}: {} -> {} (target {})".format(node, hp, cur, achieved, count))
+        else:
+            print("  node{} {}: {} -> {} (target {}, short by {} — memory too fragmented; "
+                  "try --defrag or free memory)".format(node, hp, cur, achieved, count, count - achieved))
     print()
 
 
@@ -2054,8 +2243,11 @@ finding. If the system is clean it prints 'No issues found.' Checks performed:
                            Recommends --release, which absorbs surplus back into
                            the persistent pool (in-use pages stay put).
 
-Destructive operations (--unlink, --release; require root)
-----------------------------------------------------------
+Destructive operations (--unlink, --release, --defrag, --grow; require root)
+----------------------------------------------------------------------------
+When several are given they run in the order unlink -> release -> defrag -> grow, so each step
+maximizes the next (free dead files, drain the free pool, reclaim/compact, then allocate).
+
 --unlink   Walks every hugetlbfs mount listed in /proc/mounts and removes any top-level file
            that no process is currently holding. "Holding" is determined by (device_id, inode)
            matching against /proc/<pid>/maps and /proc/<pid>/fd, NOT by path: a process in a
@@ -2075,6 +2267,22 @@ Destructive operations (--unlink, --release; require root)
            with a status line. Running --unlink first frees pages backing dead hugetlbfs files so
            the subsequent --release reclaims more — when both flags are given they execute in
            that order.
+--defrag   Frees reclaimable memory and defragments it so higher-order (hugepage) allocations are
+           more likely to succeed: `sync`, then `echo 3 > /proc/sys/vm/drop_caches` (evicts clean
+           page cache — a perf hit until it repopulates), then a global `echo 1 >
+           /proc/sys/vm/compact_memory`. Prints the count of allocatable hugepages from the buddy
+           allocator before and after (safe = Movable/Reclaimable/CMA, max = all migration types),
+           per size, so you can see whether it helped. 1 GiB shows "pool-only": its order exceeds
+           the buddy allocator's MAX_ORDER, so compaction can't assemble it (use boot-time
+           hugepages= or hugetlb_cma= instead).
+--grow     Grows one NUMA node's hugepage pool, as SIZE:NODE:COUNT (e.g. 1G:0:8 or 2M:1:512;
+           repeatable). COUNT is an ABSOLUTE per-node target: the node's nr_hugepages is written
+           up to COUNT, never down (a pool already at/above COUNT is left unchanged). If the kernel
+           can't reach the target in one write, --grow compacts that node (echo 1 >
+           /sys/devices/system/node/<n>/compact) and retries a couple of times, then reports
+           `current -> achieved (target)` and any shortfall. Per-node only by design — run one
+           --grow per node you need. A runtime 1 GiB grow usually falls short unless the memory is
+           unusually unfragmented or a hugetlb_cma area exists; that is expected, not a bug.
 
 Notes on attribution limits
 ---------------------------
@@ -2126,10 +2334,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="shrink every hugepage pool to its reserved + in-use pages, returning "
                          "the unreserved free pages to the allocator; absorbs surplus first "
                          "(requires root)")
+    ap.add_argument("--defrag", action="store_true",
+                    help="reclaim page cache and compact memory (sync + drop_caches + global "
+                         "compact_memory) so more hugepages can be allocated; shows allocatable "
+                         "before/after (requires root)")
+    ap.add_argument("--grow", action="append", metavar="SIZE:NODE:COUNT",
+                    help="grow a NUMA node's hugepage pool to COUNT pages, e.g. '1G:0:8' or "
+                         "'2M:1:512' (repeatable). COUNT is an absolute per-node target and won't "
+                         "shrink; compacts + retries on shortfall (requires root)")
     ap.add_argument("--dry-run", action="store_true",
-                    help="with --unlink/--release: report what would be done without modifying "
-                         "anything; useful for verifying the holder set on a new box before any "
-                         "destructive action")
+                    help="with --unlink/--release/--defrag/--grow: report what would be done "
+                         "without modifying anything; useful for verifying on a new box before "
+                         "any destructive action")
     ap.add_argument("--doctor", action="store_true",
                     help="run a quick health check and print only fix recommendations "
                          "(low available memory, unused hugetlbfs files, idle hugepage pools, "
@@ -2157,17 +2373,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         return run_doctor(low_mem_pct=args.low_mem_pct,
                             low_mem_max=args.low_mem_max)
 
-    if args.unlink or args.release:
+    if args.unlink or args.release or args.defrag or args.grow:
         if not args.dry_run and hasattr(os, "geteuid") and os.geteuid() != 0:
-            print("error: --unlink and --release require root (use --dry-run for a non-destructive preview)",
-                  file=sys.stderr)
+            print("error: --unlink/--release/--defrag/--grow require root "
+                  "(use --dry-run for a non-destructive preview)", file=sys.stderr)
             return 1
-        # Unlink first so that any unreferenced hugetlbfs files release
-        # their hugepages before --release tries to drain the pool.
+        # Order matters: free dead hugetlbfs files, drain the free pool, reclaim
+        # + compact memory, then allocate — so each step maximizes the next.
         if args.unlink:
             unlink_unused_hugetlbfs(dry_run=args.dry_run)
         if args.release:
             release_hugepages(dry_run=args.dry_run)
+        if args.defrag:
+            run_defrag(dry_run=args.dry_run)
+        if args.grow:
+            grow_hugepages(args.grow, dry_run=args.dry_run)
 
     mem = parse_meminfo()
     pools = collect_hugepages()

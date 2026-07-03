@@ -14,6 +14,11 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Pattern, Tuple
 
+# Single monotonic version = git commit count. The release workflow
+# (.github/workflows/release.yml) stamps this with `git rev-list --count HEAD`
+# on every push to main; a plain source checkout stays at "0".
+__version__ = "0"
+
 HUGEPAGES_ROOT = Path("/sys/kernel/mm/hugepages")
 NUMA_ROOT = Path("/sys/devices/system/node")
 MEMINFO = Path("/proc/meminfo")
@@ -2093,6 +2098,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         epilog="For a full explanation of every column, run `memsleuth --help-fields`.",
         formatter_class=formatter,
     )
+    ap.add_argument("--version", "-V", action="version",
+                    version="memsleuth {}".format(
+                        __version__ if __version__ != "0" else "0 (dev build)"),
+                    help="print the version (a single increasing number) and exit")
     ap.add_argument("--numa", action="store_true",
                     help="break down hugepages per NUMA node; with --procs also adds a per-process "
                          "'RSS by NUMA' column showing per-node residency (N0/N1/... compact)")

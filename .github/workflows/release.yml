@@ -1,0 +1,54 @@
+name: release
+
+# Every push to main runs the tests and, if they pass, publishes a GitHub
+# Release. The version is a single increasing number: `git rev-list --count
+# HEAD` (the commit count). No manual tagging — the workflow creates tag/release
+# vN for you, and the stamped memsleuth.py is attached so
+# https://github.com/weka/memsleuth/releases/latest/download/memsleuth.py
+# always serves the newest build.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history so the commit count is accurate
+
+      - name: Run tests
+        run: python3 -m unittest tests.test_cli
+
+      - name: Compute version and stamp memsleuth.py
+        id: ver
+        run: |
+          N=$(git rev-list --count HEAD)
+          echo "version=$N" >> "$GITHUB_OUTPUT"
+          sed -i "s/^__version__ = .*/__version__ = \"$N\"/" memsleuth.py
+          grep -q "^__version__ = \"$N\"\$" memsleuth.py || { echo "stamp failed"; exit 1; }
+          echo "stamped version $N"
+
+      - name: Publish release vN
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          N=${{ steps.ver.outputs.version }}
+          if gh release view "v$N" >/dev/null 2>&1; then
+            # Same commit re-run: refresh the asset rather than fail.
+            gh release upload "v$N" memsleuth.py --clobber
+          else
+            gh release create "v$N" memsleuth.py \
+              --title "v$N" \
+              --target "${{ github.sha }}" \
+              --notes "Automated release of memsleuth version $N (commit ${{ github.sha }})."
+          fi

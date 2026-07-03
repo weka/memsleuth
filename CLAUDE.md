@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Running
 
-`memsleuth` is a single-file Python 3 script, stdlib-only (no deps, no build, no tests yet). It targets **Python 3.6+** so it runs on older server baselines; keep annotations using the `typing` module (`Dict`/`List`/`Optional`/`Tuple`/`Pattern`) rather than PEP 585/604 syntax (`dict[...]`, `X | None`), and don't add `from __future__ import annotations` (3.7+).
+`memsleuth` is a single-file Python 3 script, stdlib-only (no deps, no build). It targets **Python 3.6+** so it runs on older server baselines; keep annotations using the `typing` module (`Dict`/`List`/`Optional`/`Tuple`/`Pattern`) rather than PEP 585/604 syntax (`dict[...]`, `X | None`), and don't add `from __future__ import annotations` (3.7+).
 
 ```bash
 ./memsleuth.py                  # free-style summary + hugetlb pools + THP + DirectMap
@@ -17,6 +17,10 @@ sudo ./memsleuth.py --procs     # needed to attribute memory for other users' pr
 ```
 
 Per-process mode requires `root` or `CAP_SYS_PTRACE` to read `/proc/<pid>/smaps` for processes you don't own; kernel threads are distinct from permission-denied processes and the code reports them separately on purpose.
+
+## Versioning & releases
+
+The version is a **single increasing integer = git commit count** (`git rev-list --count HEAD`), shown by `--version`/`-V`. `__version__` in `memsleuth.py` is a literal `"0"` sentinel in-tree (a plain checkout reports `0 (dev build)`). On every push to `main`, `.github/workflows/release.yml` runs the tests, `sed`-stamps `__version__` with the commit count, and publishes GitHub Release `vN` with the stamped `memsleuth.py` attached (so `releases/latest/download/memsleuth.py` is always newest). **Don't** hand-edit `__version__` or change its line format (`^__version__ = "..."`) — the release `sed`/`grep` depends on it. No manual tagging: the workflow creates tag `vN`.
 
 ## Architecture
 

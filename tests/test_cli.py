@@ -179,6 +179,16 @@ class TestDestructiveRequiresRoot(unittest.TestCase):
         self.assertIn("require root", err)
 
 
+class TestVersion(unittest.TestCase):
+    def test_version_long(self):
+        out, _, _ = run("--version")
+        self.assertIn("memsleuth", out)
+
+    def test_version_short(self):
+        out, _, _ = run("-V")
+        self.assertIn("memsleuth", out)
+
+
 class TestReleaseTarget(unittest.TestCase):
     """Pure arithmetic behind --release. `nr` reads back as the total pool
     (already includes surplus); the target keeps reserved + in-use pages."""
